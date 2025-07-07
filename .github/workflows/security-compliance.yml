@@ -90,42 +90,42 @@ jobs:
               per_page: 100
             });
 
-            for (let line of lines) {
-              let [ruleId, file, lineNum, severity] = line.split(/[\|\/]+/);
+            for (const line of lines) {
+              const [ruleId, rawFile, lineNum, severity] = line.split('|||');
               const sev = severity.toLowerCase();
 
-              // Normalize file path: remove leading slashes or "./"
-              file = file.replace(/^(\.\/|\/+)/, '');
+              // Normalize path (remove leading "./" or "/")
+              const file = rawFile.replace(/^(\.\/|\/+)/, '');
 
-              // 1) Skip non-code artifacts
+              // Skip non-code artifacts
               if (!file.includes('.')) {
                 console.log(`skipping non-code artifact: ${file}`);
                 continue;
               }
 
-              // 2) Verify that the file actually exists in the workspace
+              // Verify the file exists
               const fullPath = path.join(process.cwd(), file);
               if (!fs.existsSync(fullPath)) {
                 console.log(`file not found, skipping: ${file}`);
                 continue;
               }
 
-              // 3) Skip if we already have an open issue for this rule+file
+              // Skip if issue already exists
               const already = issues.some(issue =>
                 issue.title.includes(ruleId) &&
                 issue.title.includes(file) &&
                 issue.labels.some(l => l.name === sev)
               );
               if (already) {
-                console.log(`issue already exists for ${ruleId} in ${file}`);
+                console.log(`issue exists for ${ruleId} in ${file}`);
                 continue;
               }
 
-              // 4) Build a proper GitHub URL to the exact line
-              const encodedPath = encodeURI(file);
-              const fileUrl = `https://github.com/${owner}/${repo}/blob/${sha}/${encodedPath}#L${lineNum}`;
+              // Build URL to exact line in this commit
+              const encoded = encodeURI(file);
+              const fileUrl = `https://github.com/${owner}/${repo}/blob/${sha}/${encoded}#L${lineNum}`;
 
-              const title = `Security Compliance [${severity}] ${ruleId} in ${file}:${lineNum}`;
+              const title = `[Security Compliance] [${severity}] ${ruleId} in ${file}:${lineNum}`;
               const body = `
               A new **${severity}** finding was detected by your Security Compliance workflow.
             
@@ -133,17 +133,14 @@ jobs:
             - **File:** [${file}](${fileUrl})
             - **Line:** ${lineNum}
               
-              For full context, download the merged SARIF artifact from this workflow run.
+              Download the merged SARIF artifact from this workflow run for full context.
               `;
               
               console.log(`opening issue for ${file}:${lineNum}`);
               await github.rest.issues.create({
-              owner,
-              repo,
-              title,
-              body,
+              owner, repo,
+              title, body,
             labels: ['security', sev]
             });
               }
-
 
