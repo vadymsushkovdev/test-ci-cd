@@ -1,10 +1,17 @@
 name: Approval Check
 
+# Token permissions for this workflow
+permissions:
+  contents: read        # checkout still works
+  issues:   write       # allow manual-approval to create an Issue
+  # pull-requests: write  # uncomment if you later need to comment on PRs
+
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
+# Prevent parallel prod runs
 concurrency:
   group: prod
   cancel-in-progress: false
@@ -15,10 +22,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # 1. Check out code with full history (needed for compareCommits)
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      # 2. Build a changelog of commits since the current main tip
       - name: Collect commit list
         id: commits
         uses: actions/github-script@v7
@@ -29,18 +38,24 @@ jobs:
             const head = process.env.GITHUB_SHA;
             const { owner, repo } = context.repo;
 
-            const res = await github.rest.repos.compareCommits({ owner, repo, base, head });
+            const res = await github.rest.repos.compareCommits({
+              owner,
+              repo,
+              base,
+              head
+            });
 
             const list = res.data.commits.map(c =>
-              `- ${c.sha.slice(0,7)}  ${c.commit.message.split('\n')[0]} (@${c.author?.login ?? c.commit.author.name})`
+              `- ${c.sha.slice(0, 7)}  ${c.commit.message.split('\n')[0]} (@${c.author?.login ?? c.commit.author.name})`
             ).join('\n');
 
             core.setOutput('changes', list);
 
+      # 3. Pause for manual approval, showing the changelog
       - uses: trstringer/manual-approval@v1
         with:
           secret: ${{ secrets.GITHUB_TOKEN }}
-          approvers: vadymsushkovdev
+          approvers: vadymsushkovdev          # comma-separate if multiple
           minimum-approvals: 1
           fail-on-denial: true
           issue-title: "Production deploy ${{ github.sha }}"
