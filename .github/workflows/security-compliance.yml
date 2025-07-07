@@ -79,22 +79,17 @@ jobs:
             const fs   = require('fs');
             const path = require('path');
 
-            // 1) Read and parse findings into groups by file
+            // 1) Read and group findings by file
             const groups = {};
             for (const raw of fs.readFileSync('findings.txt','utf8')
                                   .trim().split('\n').filter(Boolean)) {
               const parts = raw.split('|||');
               if (parts.length !== 3) continue;
               const [ruleId, rawFile, lineAndSev] = parts;
-              const ls = lineAndSev.split('//');
-              if (ls.length !== 2) continue;
-              const [lineNum, sevRaw] = ls;
+              const [lineNum, sevRaw] = lineAndSev.split('//');
               const severity = sevRaw.toUpperCase();
-              // normalize path
               let file = rawFile.replace(/^(\.\/|\/+)/, '');
-              // skip vendored or non‐code
               if (file.includes('node_modules') || !file.includes('.')) continue;
-              // existence or terraform fallback
               let fullPath = path.join(process.cwd(), file);
               if (!fs.existsSync(fullPath)) {
                 const alt = path.join(process.cwd(), 'infra/terraform', file);
@@ -105,7 +100,6 @@ jobs:
                   continue;
                 }
               }
-              // initialize group
               groups[file] = groups[file] || [];
               groups[file].push({ ruleId, lineNum, severity });
             }
@@ -120,37 +114,37 @@ jobs:
 
             // 3) For each file group, open one issue
             for (const [file, findings] of Object.entries(groups)) {
-              // determine highest severity for label
-              const sev = findings.some(f=>f.severity==='CRITICAL')
-                          ? 'critical' : 'high';
+              // determine label
+              const sev = findings.some(f => f.severity === 'CRITICAL')
+                          ? 'critical'
+                          : 'high';
 
-              // avoid duplicate: by file and label
-              const exists = issues.some(issue =>
-                issue.title.includes(file) &&
-                issue.labels.some(l=>l.name===sev)
-              );
-              if (exists) continue;
+              // skip dupes
+              if (issues.some(issue =>
+                  issue.title.includes(file) &&
+                  issue.labels.some(l => l.name === sev))
+              ) continue;
 
-              // build issue body listing all findings
+              // build bullets
               const encoded = encodeURI(file);
-              const fileUrlBase = `https://github.com/${owner}/${repo}/blob/${sha}/${encoded}`;
-              const bodyLines = findings.map(f =>
-                `- [L${f.lineNum}](${fileUrlBase}#L${f.lineNum}): **${f.ruleId}** (${f.severity})`
+              const baseUrl = `https://github.com/${owner}/${repo}/blob/${sha}/${encoded}`;
+              const bullets = findings.map(f =>
+                `- [L${f.lineNum}](${baseUrl}#L${f.lineNum}): **${f.ruleId}** (${f.severity})`
               ).join('\n');
 
               const title = `[${sev.toUpperCase()}] Security findings in ${file}`;
-              const body = `
-              The following **${sev.toUpperCase()}** findings were detected by Trivy in \`${file}\`:
-                
-                ${bodyLines}
-                
-                Download the merged SARIF artifact from this workflow run for full details.
-                `;
-              
+              const body = [
+                `The following **${sev.toUpperCase()}** findings were detected by Trivy in \`${file}\`:`,
+                ``,
+                bullets,
+                ``,
+                `Download the \`merged.sarif\` artifact from this workflow run for full details.`
+              ].join('\n');
+
               console.log(`🚀 creating issue: ${title}`);
-                await github.rest.issues.create({
+              await github.rest.issues.create({
                 owner, repo,
                 title, body,
-              labels: ['security', sev]
+                labels: ['security', sev]
               });
-                }
+            }
