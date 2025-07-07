@@ -39,6 +39,7 @@ jobs:
   
             core.setOutput('changes', list);
 
+
       - uses: trstringer/manual-approval@v1
         with:
           secret: ${{ secrets.GITHUB_TOKEN }}
