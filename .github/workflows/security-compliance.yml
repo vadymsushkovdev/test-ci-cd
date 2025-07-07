@@ -13,24 +13,24 @@ permissions:
 
 concurrency:
   group: security-compliance
-  cancel-in-progress: true      # kill in-flight if a new run starts
+  cancel-in-progress: true      # kill any in-flight scan when a new run starts
 
 jobs:
   scan:
     runs-on: ubuntu-latest
 
     steps:
-      # ───────── 0. Checkout ────────────────────────────────────
+      # ─── 0. Checkout ─────────────────────────────────────────
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # ───────── 0.5 Setup Node ─────────────────────────────────
+      # ─── 0.5 Setup Node ───────────────────────────────────────
       - uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      # ───────── 1. Trivy scans ─────────────────────────────────
+      # ─── 1. Trivy scans (fs, image, IaC) ──────────────────────
       - name: Trivy project scan
         uses: aquasecurity/trivy-action@master
         with:
@@ -47,10 +47,10 @@ jobs:
       - name: Trivy image scan
         run: trivy image --format sarif --output trivy-image.sarif app:${{ github.sha }}
 
-      - name: Trivy IaC scan
+      - name: Trivy IaC (Terraform) scan
         run: trivy config infra/terraform --format sarif --output trivy-iac.sarif
 
-      # ───────── 2. TruffleHog JSON scan ─────────────────────────
+      # ─── 2. Secrets scan with TruffleHog CLI ───────────────────
       - name: Install TruffleHog
         run: |
           python3 -m pip install --upgrade pip
@@ -58,9 +58,10 @@ jobs:
 
       - name: Run TruffleHog local JSON scan
         run: |
-          trufflehog --json --repo_path . > trufflehog.json
+          echo "Scanning local repo at file://$GITHUB_WORKSPACE"
+          trufflehog --json file://$GITHUB_WORKSPACE > trufflehog.json
 
-      # ───────── 3. Merge SARIF files ────────────────────────────
+      # ─── 3. Merge SARIF files (Trivy only) ─────────────────────
       - name: Install sarif-cli & merge SARIF
         id: merge
         run: |
@@ -72,7 +73,7 @@ jobs:
             -o merged.sarif
           echo "sarif=merged.sarif" >> "$GITHUB_OUTPUT"
 
-      # ───────── 4. Upload combined SARIF ────────────────────────
+      # ─── 4. Upload combined SARIF to GitHub Security tab ───────
       - uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: ${{ steps.merge.outputs.sarif }}
