@@ -1,3 +1,4 @@
+# .github/workflows/security-compliance.yml
 name: Security Compliance Report
 
 on:
@@ -18,6 +19,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # ── 0. Checkout & Node setup ──────────────────────────
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -25,6 +27,7 @@ jobs:
         with:
           node-version: 20
 
+      # ── 1. Trivy scans (filesystem, image, IaC) ──────────
       - name: Trivy project scan
         uses: aquasecurity/trivy-action@master
         with:
@@ -44,6 +47,7 @@ jobs:
       - name: Trivy IaC scan
         run: trivy config infra/terraform --format sarif --output trivy-iac.sarif
 
+      # ── 2. Merge only Trivy SARIF files ───────────────────
       - name: Merge Trivy SARIF
         run: |
           jq -s '{version:"2.1.0", runs: [.[].runs[]]}' \
@@ -52,23 +56,19 @@ jobs:
             trivy-iac.sarif \
             > merged.sarif
 
+      # ── 3. Extract HIGH/CRITICAL findings with "|||" delimiter ─
       - name: Extract High/Critical results
         id: findings
         run: |
           jq -r '
             .runs[].results[]
             | select(.level=="error" or .level=="warning")
-            | "\(.ruleId)|\(.locations[0].physicalLocation.artifactLocation.uri)|\(.locations[0].physicalLocation.region.startLine)//\(.level|ascii_upcase)"' \
+            | "\(.ruleId)|||\(.locations[0].physicalLocation.artifactLocation.uri)|||\(.locations[0].physicalLocation.region.startLine)//\(.level|ascii_upcase)"' \
             merged.sarif \
           | sort -u > findings.txt
           echo "found=$(wc -l < findings.txt)" >> "$GITHUB_OUTPUT"
 
-      - name: "Debug: show findings"
-        if: always()
-        run: |
-          echo "Found ${{ steps.findings.outputs.found }} high/critical findings:"
-          cat findings.txt || echo "(none)"
-
+      # ── 4. Open issues for new findings ────────────────────
       - name: Open issues for new findings
         uses: actions/github-script@v7
         with:
@@ -91,7 +91,18 @@ jobs:
             });
 
             for (const line of lines) {
-              const [ruleId, rawFile, lineNum, severity] = line.split('|||');
+              // split on our custom delimiter
+              const parts = line.split('|||');
+              if (parts.length < 4) {
+                console.log(`❌ malformed line, skipping: ${line}`);
+                continue;
+              }
+              const [ruleId, rawFile, lineNum, severityRaw] = parts;
+              if (!severityRaw) {
+                console.log(`❌ missing severity, skipping: ${line}`);
+                continue;
+              }
+              const severity = severityRaw.toUpperCase();
               const sev = severity.toLowerCase();
 
               // Normalize path (remove leading "./" or "/")
@@ -99,29 +110,29 @@ jobs:
 
               // Skip non-code artifacts
               if (!file.includes('.')) {
-                console.log(`skipping non-code artifact: ${file}`);
+                console.log(`⚠️ skipping non-code artifact: ${file}`);
                 continue;
               }
 
-              // Verify the file exists
+              // Verify the file exists in the workspace
               const fullPath = path.join(process.cwd(), file);
               if (!fs.existsSync(fullPath)) {
-                console.log(`file not found, skipping: ${file}`);
+                console.log(`❌ file not found, skipping: ${file}`);
                 continue;
               }
 
-              // Skip if issue already exists
+              // Skip if an issue already exists for this rule+file+severity
               const already = issues.some(issue =>
                 issue.title.includes(ruleId) &&
                 issue.title.includes(file) &&
                 issue.labels.some(l => l.name === sev)
               );
               if (already) {
-                console.log(`issue exists for ${ruleId} in ${file}`);
+                console.log(`✔️ issue exists for ${ruleId} in ${file}`);
                 continue;
               }
 
-              // Build URL to exact line in this commit
+              // Build GitHub URL to the exact line
               const encoded = encodeURI(file);
               const fileUrl = `https://github.com/${owner}/${repo}/blob/${sha}/${encoded}#L${lineNum}`;
 
@@ -136,7 +147,7 @@ jobs:
               Download the merged SARIF artifact from this workflow run for full context.
               `;
               
-              console.log(`opening issue for ${file}:${lineNum}`);
+              console.log(`🚀 opening issue for ${file}:${lineNum}`);
               await github.rest.issues.create({
               owner, repo,
               title, body,
