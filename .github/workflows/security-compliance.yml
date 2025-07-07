@@ -19,47 +19,53 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ── 0. Checkout & Node setup ──────────────────────────
+      # ── 0. Checkout & Node/Trivy setup ───────────────────────
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b ~/.local/bin v0.64.1
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      # ── 1. Trivy filesystem scan ──────────────────────────
-      - name: Trivy project scan
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: fs
-          scan-ref: .
-          format: sarif
-          output: trivy-project.sarif
-          severity: CRITICAL,HIGH
-          hide-progress: true
+      # ── 1. Trivy filesystem scan (includes src/) ─────────────
+      - name: Trivy FS scan (src & root)
+        run: |
+          trivy fs --format sarif --output trivy-fs.sarif .
 
-      # ── 2. Trivy image scan ───────────────────────────────
-      - name: Build Docker image for scan
+      # ── 2. Trivy IaC scan (terraform) ────────────────────────
+      - name: Trivy IaC scan
+        run: |
+          if [ -d infra/terraform ]; then
+            trivy config --format sarif --output trivy-iac.sarif infra/terraform
+          else
+            echo "no infra/terraform folder, skipping IaC"
+            touch trivy-iac.sarif
+          fi
+
+      # ── 3. Trivy image scan ───────────────────────────────────
+      - name: Build Docker image
         run: docker build -t app:${{ github.sha }} .
 
       - name: Trivy image scan
-        run: trivy image --format sarif --output trivy-image.sarif app:${{ github.sha }}
+        run: trivy image --format sarif --output trivy-img.sarif app:${{ github.sha }}
 
-      # ── 3. Trivy IaC scan (optional) ──────────────────────
-      - name: Trivy IaC scan
-        run: trivy config infra/terraform --format sarif --output trivy-iac.sarif || true
-
-      # ── 4. Merge all Trivy SARIF files ────────────────────
-      - name: Merge Trivy SARIF
+      # ── 4. Merge all Trivy SARIFs ────────────────────────────
+      - name: Merge SARIFs
         run: |
           jq -s '{version:"2.1.0", runs: [.[].runs[]]}' \
-            trivy-project.sarif \
-            trivy-image.sarif \
+            trivy-fs.sarif \
             trivy-iac.sarif \
+            trivy-img.sarif \
           > merged.sarif
 
-      # ── 5. Extract HIGH/CRITICAL findings ─────────────────
-      - name: Extract High/Critical results
+      # ── 5. Extract HIGH/CRITICAL findings ────────────────────
+      - name: Extract findings
         id: findings
         run: |
           jq -r '
@@ -70,7 +76,7 @@ jobs:
           | sort -u > findings.txt
           echo "found=$(wc -l < findings.txt)" >> "$GITHUB_OUTPUT"
 
-      # ── 6. Open (grouped) issues for new findings ─────────
+      # ── 6. Open grouped issues per file ──────────────────────
       - name: Open issues for new findings
         uses: actions/github-script@v7
         with:
@@ -79,88 +85,60 @@ jobs:
             const fs   = require('fs');
             const path = require('path');
 
-            // Group findings by file
+            // 1) read & group
             const groups = {};
-            for (let raw of fs.readFileSync('findings.txt','utf8')
-                                  .trim().split('\n').filter(Boolean)) {
-              // strip any leading file:// URI
+            for (let raw of fs.readFileSync('findings.txt','utf8').split('\n').filter(Boolean)) {
               raw = raw.replace(/^file:\/\/[^|]+/, '');
-              const parts = raw.split('|||');
-              if (parts.length !== 3) continue;
-
-              const [ruleId, rawFile, lineAndSev] = parts;
+              const [ruleId, rawFile, lineAndSev] = raw.split('|||');
+              if (!ruleId||!rawFile||!lineAndSev) continue;
               const [lineNum, sevRaw] = lineAndSev.split('//');
               const severity = sevRaw.toUpperCase();
+              let file = rawFile.replace(/^(\.\/|\/)+/,'');
+              if (!file.includes('.') || file.includes('node_modules')) continue;
 
-              // normalize path
-              let file = rawFile
-                .replace(/^file:\/\/[^/]+\/+/, '')
-                .replace(/^(\.\/|\/)+/, '');
-
-              // skip vendored or non-code
-              if (file.includes('node_modules') || !file.includes('.')) continue;
-
-              // try repo root, then src/, then lib/
-              let fullPath = path.join(process.cwd(), file);
-              if (!fs.existsSync(fullPath)) {
-                const alt1 = path.join(process.cwd(), 'src', file);
-                const alt2 = path.join(process.cwd(), 'lib', file);
-                if (fs.existsSync(alt1)) {
-                  file = path.posix.join('src', file);
-                  fullPath = alt1;
-                } else if (fs.existsSync(alt2)) {
-                  file = path.posix.join('lib', file);
-                  fullPath = alt2;
-                } else {
-                  console.log(`❌ file not found, skipping: ${file}`);
-                  continue;
+              // verify existence or try src/lib
+              let p = path.join(process.cwd(), file);
+              if (!fs.existsSync(p)) {
+                for (const prefix of ['src','lib','infra/terraform']) {
+                  const alt = path.join(process.cwd(), prefix, file);
+                  if (fs.existsSync(alt)) {
+                    file = `${prefix}/${file}`;
+                    p = alt;
+                    break;
+                  }
                 }
               }
+              if (!fs.existsSync(p)) continue;
 
-              groups[file] = groups[file] || [];
-              groups[file].push({ ruleId, lineNum, severity });
+              groups[file] = groups[file]||[];
+              groups[file].push({ruleId, lineNum, severity});
             }
 
             const { owner, repo } = context.repo;
             const sha = process.env.GITHUB_SHA;
+            const existing = (await github.rest.issues.listForRepo({
+              owner, repo, state:'open', per_page:100
+            })).data;
 
-            // Preload existing open issues
-            const { data: issues } = await github.rest.issues.listForRepo({
-              owner, repo, state: 'open', per_page: 100
-            });
+            // 2) one issue per file
+            for (const [file, finds] of Object.entries(groups)) {
+              const label = finds.some(f=>f.severity==='CRITICAL') ? 'critical' : 'high';
+              if (existing.find(i=> i.title.includes(file) && i.labels.find(l=>l.name===label))) {
+                continue;
+              }
 
-            // For each file, open a single grouped issue
-            for (const [file, findings] of Object.entries(groups)) {
-              // pick highest severity label
-              const sev = findings.some(f=>f.severity==='CRITICAL')
-                          ? 'critical'
-                          : 'high';
+              const base = `https://github.com/${owner}/${repo}/blob/${sha}/${encodeURI(file)}`;
+              const bullets = finds.map(f=>`- [L${f.lineNum}](${base}#L${f.lineNum}): **${f.ruleId}** (${f.severity})`).join('\n');
 
-              // skip if issue already exists for this file+severity
-              if (issues.some(issue =>
-                  issue.title.includes(file) &&
-                  issue.labels.some(l=>l.name===sev)
-              )) continue;
-
-              // build bullets
-              const baseUrl = `https://github.com/${owner}/${repo}/blob/${sha}/${encodeURI(file)}`;
-              const bullets = findings.map(f =>
-                `- [L${f.lineNum}](${baseUrl}#L${f.lineNum}): **${f.ruleId}** (${f.severity})`
-              ).join('\n');
-
-              const title = `[${sev.toUpperCase()}] Security findings in ${file}`;
-              const body = [
-                `The following **${sev.toUpperCase()}** findings were detected by Trivy in \`${file}\`:`,
-                ``,
+              const title = `[${label.toUpperCase()}] Security findings in ${file}`;
+              const body  = [
+                `The following **${label.toUpperCase()}** findings were detected by Trivy in \`${file}\`:`,
+                '',
                 bullets,
-                ``,
-                `Download the \`merged.sarif\` artifact from this workflow run for full details.`
+                '',
+                'Download the `merged.sarif` artifact from this run for full context.'
               ].join('\n');
 
-              console.log(`🚀 creating issue: ${title}`);
-              await github.rest.issues.create({
-                owner, repo,
-                title, body,
-                labels: ['security', sev]
-              });
+              console.log('➤ Creating issue:', title);
+              await github.rest.issues.create({ owner, repo, title, body, labels: ['security',label] });
             }
