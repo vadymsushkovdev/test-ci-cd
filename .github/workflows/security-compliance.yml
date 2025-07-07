@@ -23,12 +23,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
       - uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      # ── 1. Trivy scans (filesystem, image, IaC) ──────────
+      # ── 1. Trivy filesystem scan ──────────────────────────
       - name: Trivy project scan
         uses: aquasecurity/trivy-action@master
         with:
@@ -39,16 +38,18 @@ jobs:
           severity: CRITICAL,HIGH
           hide-progress: true
 
+      # ── 2. Trivy image scan ───────────────────────────────
       - name: Build Docker image for scan
         run: docker build -t app:${{ github.sha }} .
 
       - name: Trivy image scan
         run: trivy image --format sarif --output trivy-image.sarif app:${{ github.sha }}
 
+      # ── 3. Trivy IaC scan (optional) ──────────────────────
       - name: Trivy IaC scan
-        run: trivy config infra/terraform --format sarif --output trivy-iac.sarif
+        run: trivy config infra/terraform --format sarif --output trivy-iac.sarif || true
 
-      # ── 2. Merge only Trivy SARIF files ───────────────────
+      # ── 4. Merge all Trivy SARIF files ────────────────────
       - name: Merge Trivy SARIF
         run: |
           jq -s '{version:"2.1.0", runs: [.[].runs[]]}' \
@@ -57,7 +58,7 @@ jobs:
             trivy-iac.sarif \
           > merged.sarif
 
-      # ── 3. Extract HIGH/CRITICAL findings with unambiguous delimiter ─
+      # ── 5. Extract HIGH/CRITICAL findings ─────────────────
       - name: Extract High/Critical results
         id: findings
         run: |
@@ -69,7 +70,7 @@ jobs:
           | sort -u > findings.txt
           echo "found=$(wc -l < findings.txt)" >> "$GITHUB_OUTPUT"
 
-      # ── 4. Open issues for new findings ────────────────────
+      # ── 6. Open issues for new findings ────────────────────
       - name: Open issues for new findings
         uses: actions/github-script@v7
         with:
@@ -83,7 +84,7 @@ jobs:
             const { owner, repo } = context.repo;
             const sha = process.env.GITHUB_SHA;
 
-            // Fetch all open issues once
+            // Preload open issues
             const { data: issues } = await github.rest.issues.listForRepo({
               owner, repo, state: 'open', per_page: 100
             });
@@ -108,46 +109,52 @@ jobs:
               const sev = severity.toLowerCase();
 
               // 3) Normalize path
-              const file = rawFile.replace(/^(\.\/|\/+)/, '');
+              let file = rawFile.replace(/^(\.\/|\/+)/, '');
 
-              // 4) Skip non-code artifacts
-              if (!file.includes('.')) {
-                console.log(`⚠️ skipping non-code artifact: ${file}`);
+              // 4) Skip vendored or non-code artifacts
+              if (file.includes('node_modules') || !file.includes('.')) {
+                console.log(`⚠️ skipping artifact: ${file}`);
                 continue;
               }
 
-              // 5) Verify the file exists locally
-              const fullPath = path.join(process.cwd(), file);
+              // 5) Verify existence, try infra/terraform fallback
+              let fullPath = path.join(process.cwd(), file);
               if (!fs.existsSync(fullPath)) {
-                console.log(`❌ file not found, skipping: ${file}`);
-                continue;
+                const alt = path.join(process.cwd(), 'infra/terraform', file);
+                if (fs.existsSync(alt)) {
+                  file = path.posix.join('infra/terraform', file);
+                  fullPath = alt;
+                } else {
+                  console.log(`❌ file not found, skipping: ${file}`);
+                  continue;
+                }
               }
 
               // 6) Avoid duplicate issues
-              const exists = issues.some(issue =>
+              const dup = issues.some(issue =>
                 issue.title.includes(ruleId) &&
                 issue.title.includes(file) &&
                 issue.labels.some(l => l.name === sev)
               );
-              if (exists) {
-                console.log(`✔️ issue already exists for ${ruleId} in ${file}`);
+              if (dup) {
+                console.log(`✔️ already have issue for ${ruleId} in ${file}`);
                 continue;
               }
 
-              // 7) Construct GitHub file URL
+              // 7) Build link to exact line
               const encoded = encodeURI(file);
               const fileUrl = `https://github.com/${owner}/${repo}/blob/${sha}/${encoded}#L${lineNum}`;
 
               // 8) Create the issue
-              const title = `[Security Compliance] [${severity}] ${ruleId} in ${file}:${lineNum}`;
+              const title = `[${severity}] ${ruleId} in ${file}:${lineNum}`;
               const body = `
-              A new **${severity}** finding was detected by your Security Compliance workflow.
+              A new **${severity}** finding was detected by Trivy.
             
             - **Rule:** ${ruleId}
             - **File:** [${file}](${fileUrl})
             - **Line:** ${lineNum}
               
-              Download the merged SARIF artifact from this workflow run for full context.
+              Download the **merged.sarif** artifact from this workflow run for full context.
               `;
             console.log(`🚀 opening issue: ${title}`);
               await github.rest.issues.create({
