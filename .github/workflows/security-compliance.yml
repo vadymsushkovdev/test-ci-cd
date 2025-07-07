@@ -1,3 +1,4 @@
+# .github/workflows/security-compliance.yml
 name: Security Compliance Report
 
 on:
@@ -79,7 +80,7 @@ jobs:
           | sort -u > findings.txt
           echo "found=$(wc -l < findings.txt)" >> "$GITHUB_OUTPUT"
 
-      - name: [Debug] show findings
+      - name: "Debug: show findings"
         if: always()
         run: |
           echo "Found ${{ steps.findings.outputs.found }} high/critical findings:"
@@ -99,7 +100,7 @@ jobs:
               const [ruleId, file, lineNum, severity] = line.split(/[\|\/]+/);
               const sev = severity.toLowerCase();  // "HIGH" → "high"
 
-              // Skip if issue already exists for this rule+file
+              // Skip if issue already exists
               const { data: issues } = await github.rest.issues.listForRepo({
                 owner, repo,
                 labels: ['security', sev],
