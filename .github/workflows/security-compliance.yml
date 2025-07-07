@@ -1,17 +1,12 @@
-# .github/workflows/security-compliance.yml
 name: Security Compliance Report
 
 on:
   push:
     branches: [main]
-  schedule:
-    - cron: '*/5 * * * *'        # every 5 minutes (UTC)
 
 permissions:
   contents: read
-  security-events: write    # for SARIF upload
-  issues: write             # to open security issues
-  pull-requests: write
+  issues: write
 
 concurrency:
   group: security-compliance
@@ -27,12 +22,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      # ── 0.5 Setup Node ───────────────────────────────────────
       - uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      # ── 1. CodeQL SAST ───────────────────────────────────────
       - name: Init CodeQL
         uses: github/codeql-action/init@v3
         with:
@@ -44,9 +37,9 @@ jobs:
       - name: Run CodeQL analyze
         uses: github/codeql-action/analyze@v3
         with:
-          output: codeql.sarif      # collect SARIF for merge
+          output: codeql.sarif
+          upload: false
 
-      # ── 2. Trivy scans (fs, image, IaC) ───────────────────────
       - name: Trivy project scan
         uses: aquasecurity/trivy-action@master
         with:
@@ -66,67 +59,71 @@ jobs:
       - name: Trivy IaC scan
         run: trivy config infra/terraform --format sarif --output trivy-iac.sarif
 
-      # ── 3. Merge all SARIF files ───────────────────────────────
       - name: Merge SARIF (CodeQL + Trivy)
-        id: merge
         run: |
-          # combine runs from all SARIFs
           jq -s '{version:"2.1.0", runs: [.[].runs[]]}' \
             codeql.sarif \
             trivy-project.sarif \
             trivy-image.sarif \
             trivy-iac.sarif \
             > merged.sarif
-          echo "sarif=merged.sarif" >> "$GITHUB_OUTPUT"
 
-      # ── 4. Upload combined SARIF ───────────────────────────────
-      - name: Upload merged SARIF to Code Scanning
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: ${{ steps.merge.outputs.sarif }}
+      - name: Extract High/Critical results from SARIF
+        id: findings
+        run: |
+          jq -r '
+            .runs[].results[]
+            | select(.level=="error" or .level=="warning")
+            | "\(.ruleId)|\(.locations[0].physicalLocation.artifactLocation.uri)|\(.locations[0].physicalLocation.region.startLine)//\(.level|ascii_upcase)"' \
+            merged.sarif \
+          | sort -u > findings.txt
+          echo "found=$(wc -l < findings.txt)" >> "$GITHUB_OUTPUT"
 
-      # ── 5. Create issues for High/Critical alerts ──────────────
-      - name: Create issues for High/Critical alerts
+      - name: [Debug] show findings
+        if: always()
+        run: |
+          echo "Found ${{ steps.findings.outputs.found }} high/critical findings:"
+          cat findings.txt || echo "(none)"
+
+      - name: Open issues for new findings
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const severities = ['CRITICAL', 'HIGH'];
+            const fs = require('fs');
+            const lines = fs.readFileSync('findings.txt','utf8')
+              .trim().split('\n').filter(Boolean);
             const { owner, repo } = context.repo;
 
-            console.log('⏳ fetching code-scanning alerts…');
-            const { data: alerts } = await github.rest.codeScanning.listAlertsForRepo({
-              owner, repo, state: 'open', per_page: 100
-            });
-            console.log(`🔍 found ${alerts.length} alerts`);
+            for (const line of lines) {
+              const [ruleId, file, lineNum, severity] = line.split(/[\|\/]+/);
+              const sev = severity.toLowerCase();  // "HIGH" → "high"
 
-            for (const alert of alerts) {
-              const sev = alert.rule.severity.toUpperCase();
-              if (!severities.includes(sev)) continue;
-
-              // skip if already issued
-              const { data: existing } = await github.rest.search.issuesAndPullRequests({
-                q: `repo:${owner}/${repo} is:issue in:title "${alert.rule.id}"`
+              // Skip if issue already exists for this rule+file
+              const { data: issues } = await github.rest.issues.listForRepo({
+                owner, repo,
+                labels: ['security', sev],
+                state: 'open',
+                per_page: 50
               });
-              if (existing.total_count) continue;
+              if (issues.find(i => i.title.includes(ruleId) && i.title.includes(file))) {
+                continue;
+              }
 
-              const title = `[${sev}] Code Scan: ${alert.rule.id} – ${alert.rule.description}`;
+              // Create a new issue
+              const title = `[${severity}] ${ruleId} in ${file}:${lineNum}`;
               const body = `
-              **A new ${sev} vulnerability was detected by ${alert.tool.name}.**
+              A new **${severity}** issue was detected by your Security Compliance workflow.
+            
+            - **Rule:** ${ruleId}
+            - **File:** ${file}
+            - **Line:** ${lineNum}
               
-              **Rule:** ${alert.rule.id}
-              **Message:** ${alert.rule.description}
-              **File:** ${alert.location?.resultFile?.uri ?? 'unknown'}
-              **Line:** ${alert.location?.resultFile?.startLine ?? 'n/a'}
+              For more details, check the merged SARIF in the workflow run artifacts.`;
               
-              🔗 [View the alert in GitHub](${alert.html_url})
-              
-              _This issue was auto-generated._`;
-              
-              console.log(`🚀 opening issue for ${alert.rule.id}`);
               await github.rest.issues.create({
               owner, repo,
               title, body,
-            labels: ['security', sev.toLowerCase()]
+            labels: ['security', sev]
             });
               }
