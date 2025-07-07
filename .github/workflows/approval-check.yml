@@ -5,7 +5,7 @@ on:
     branches: [main]
   workflow_dispatch:
 
-concurrency:                  # don't need parallel execution for prod
+concurrency:
   group: prod
   cancel-in-progress: false
 
@@ -25,29 +25,27 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const base = 'main';                
+            const base = 'main';
             const head = process.env.GITHUB_SHA;
             const { owner, repo } = context.repo;
-  
-            const res = await github.rest.repos.compareCommits({
-              owner, repo, base, head
-            });
-  
+
+            const res = await github.rest.repos.compareCommits({ owner, repo, base, head });
+
             const list = res.data.commits.map(c =>
               `- ${c.sha.slice(0,7)}  ${c.commit.message.split('\n')[0]} (@${c.author?.login ?? c.commit.author.name})`
             ).join('\n');
-  
-            core.setOutput('changes', list);
 
+            core.setOutput('changes', list);
 
       - uses: trstringer/manual-approval@v1
         with:
           secret: ${{ secrets.GITHUB_TOKEN }}
-          approvers: vadymsushkovdev        # comma-separated list/team
+          approvers: vadymsushkovdev
           minimum-approvals: 1
           fail-on-denial: true
           issue-title: "Production deploy ${{ github.sha }}"
           issue-body: |
-             **Changes that will be deployed to production** 
-  
+            **Changes that will be deployed to production**
+
             ${{ steps.commits.outputs.changes }}
+
