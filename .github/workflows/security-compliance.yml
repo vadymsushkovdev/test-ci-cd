@@ -70,18 +70,16 @@ jobs:
           path: trufflehog.json
 
       # ───────── 3. Merge SARIF files (Trivy only) ───────────────
-      - name: Install sarif-cli & merge SARIF
+      - name: Merge Trivy SARIF with jq
         id: merge
         run: |
-          npm install -g sarif-cli@1
-          sarif merge \
-            trivy-project.sarif \
-            trivy-image.sarif \
-            trivy-iac.sarif \
-            -o merged.sarif
+          # Combine SARIF 'runs' arrays from each file into a single SARIF
+          jq -s '{version:"2.1.0", runs: [.[].runs[]]}' \
+            trivy-project.sarif trivy-image.sarif trivy-iac.sarif \
+            > merged.sarif
           echo "sarif=merged.sarif" >> "$GITHUB_OUTPUT"
 
-      # ───────── 4. Upload combined SARIF to GitHub Security tab ──
+      # ─── 4. Upload combined SARIF to GitHub Security tab ──
       - uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: ${{ steps.merge.outputs.sarif }}
