@@ -1,8 +1,9 @@
-# .github/workflows/security-compliance.yml
 name: Security Compliance Report
 
 on:
   push:
+    branches: [main]
+  pull_request:
     branches: [main]
   workflow_dispatch:
 
@@ -19,27 +20,46 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ── 0. Checkout & setup ───────────────────────────────────
+      # ── 0. Checkout & setup Python/Node ─────────────────────────
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-python@v4
+        with: { python-version: "3.x" }
       - uses: actions/setup-node@v4
-        with:
-          node-version: 20
+        with: { node-version: "20" }
 
-      # ── 1. Install & run Semgrep CLI on src/ ──────────────────
+      # ── 1. Semgrep SAST (TS + custom Nest rules) ─────────────────
       - name: Install Semgrep
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.x'
+        run: pip install semgrep
 
-      - name: Run Semgrep on src/
+      - name: Semgrep SAST
         run: |
-          pip install semgrep
-          semgrep --config p/ci --sarif --output semgrep.sarif src
+          # scan your source dir
+          semgrep \
+            --config p/security \
+            --config .semgrep.yml \
+            --sarif --output semgrep.sarif \
+            src
 
-      # ── 2. Install & run Trivy FS scan ────────────────────────
+      # ── 2. TruffleHog secret scan ────────────────────────────────
+      - name: Install TruffleHog
+        run: pip install trufflehog
+
+      - name: TruffleHog scan for secrets
+        continue-on-error: true
+        run: trufflehog filesystem --json --repo_path . > trufflehog.json || true
+
+      - name: Upload TruffleHog results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trufflehog-results
+          path: trufflehog.json
+
+      # ── 3. Dependency review ─────────────────────────────────────
+      - uses: actions/dependency-review-action@v2
+
+      # ── 4. Trivy FS scan (OS + npm) ─────────────────────────────
       - name: Install Trivy
         run: |
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
@@ -49,7 +69,7 @@ jobs:
       - name: Trivy filesystem scan
         run: trivy fs --format sarif --output trivy-fs.sarif .
 
-      # ── 3. Trivy IaC scan ─────────────────────────────────────
+      # ── 5. Trivy IaC scan (Terraform) ───────────────────────────
       - name: Trivy IaC scan
         run: |
           if [ -d infra/terraform ]; then
@@ -58,15 +78,14 @@ jobs:
             touch trivy-iac.sarif
           fi
 
-      # ── 4. Build & Trivy image scan ──────────────────────────
+      # ── 6. Trivy container image scan ──────────────────────────
       - name: Build Docker image
         run: docker build -t app:${{ github.sha }} .
-
       - name: Trivy image scan
         run: trivy image --format sarif --output trivy-img.sarif app:${{ github.sha }}
 
-      # ── 5. Merge all SARIF reports ────────────────────────────
-      - name: Merge SARIFs
+      # ── 7. Merge all SARIFs ─────────────────────────────────────
+      - name: Merge SARIF reports
         run: |
           jq -s '{version:"2.1.0", runs: [.[].runs[]]}' \
             semgrep.sarif \
@@ -75,7 +94,7 @@ jobs:
             trivy-img.sarif \
           > merged.sarif
 
-      # ── 6. Extract HIGH/CRITICAL findings ─────────────────────
+      # ── 8. Extract only HIGH/CRITICAL findings ──────────────────
       - name: Extract findings
         id: findings
         run: |
@@ -87,32 +106,30 @@ jobs:
           | sort -u > findings.txt
           echo "found=$(wc -l < findings.txt)" >> $GITHUB_OUTPUT
 
-      # ── 7. Open grouped issues per file ───────────────────────
+      # ── 9. Open one issue per file with bullets ────────────────
       - name: Open issues for new findings
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const fs   = require('fs');
-            const path = require('path');
-            const cwd  = process.cwd();
+            const fs   = require('fs'),
+                  path = require('path'),
+                  cwd  = process.cwd();
 
-            // 1) Read & group findings by file
+            // Group findings by file
             const groups = {};
             for (let raw of fs.readFileSync('findings.txt','utf8').split('\n').filter(Boolean)) {
               raw = raw
                 .replace(/^file:\/\/[^|]+/, '')
                 .replace(new RegExp(`^${cwd}`), '');
-
               const [tool, ruleId, rawFile, lineAndSev] = raw.split('|||');
-              if (!tool||!ruleId||!rawFile||!lineAndSev) continue;
-              let [lineNum, sevRaw] = lineAndSev.split('//');
-              sevRaw = sevRaw.toUpperCase();
-
+              if (![tool,ruleId,rawFile,lineAndSev].every(Boolean)) continue;
+              const [lineNum, sevRaw] = lineAndSev.split('//');
+              const severity = sevRaw.toLowerCase();
               let file = rawFile.replace(/^(\.\/|\/)+/, '');
               if (!file.includes('.') || file.includes('node_modules')) continue;
 
-              // try root, then src/, lib/, infra/terraform
+              // locate under root/src/lib/infra/terraform
               let full = path.join(cwd, file);
               if (!fs.existsSync(full)) {
                 for (const pfx of ['src','lib','infra/terraform']) {
@@ -126,33 +143,31 @@ jobs:
               }
               if (!fs.existsSync(full)) continue;
 
-              groups[file] = groups[file] || [];
-              groups[file].push({ tool, ruleId, lineNum, severity: sevRaw });
+              groups[file] = groups[file]||[];
+              groups[file].push({ tool, ruleId, lineNum, severity });
             }
 
-            const { owner, repo } = context.repo;
-            const sha = process.env.GITHUB_SHA;
+            const { owner, repo } = context.repo,
+                  sha            = process.env.GITHUB_SHA;
             const existing = (await github.rest.issues.listForRepo({
-              owner, repo, state: 'open', per_page: 100
+              owner, repo, state:'open', per_page:100
             })).data;
 
-            // 2) One issue per file
             for (const [file, finds] of Object.entries(groups)) {
-              const label = finds.some(f => f.severity === 'CRITICAL')
-                ? 'critical' : 'high';
-              if (existing.find(i =>
+              const label = finds.some(f=>f.severity==='critical') ? 'critical' : 'high';
+              if (existing.find(i=>
                 i.title.includes(file) &&
-                i.labels.some(l => l.name === label)
+                i.labels.some(l=>l.name===label)
               )) continue;
 
               const baseUrl = `https://github.com/${owner}/${repo}/blob/${sha}/${encodeURI(file)}`;
-              const bullets = finds.map(f =>
+              const bullets = finds.map(f=>
                 `- [L${f.lineNum}](${baseUrl}#L${f.lineNum}): **${f.ruleId}** (${f.tool}/${f.severity})`
               ).join('\n');
 
               const title = `[${label.toUpperCase()}] Security findings in ${file}`;
               const body  = [
-                `Detected the following **${label.toUpperCase()}** issues in \`${file}\`:`,
+                `Detected the following **${label.toUpperCase()}** issues in \`${file}\``,
                 '',
                 bullets,
                 '',
@@ -161,7 +176,8 @@ jobs:
 
               console.log('➤ Creating issue:', title);
               await github.rest.issues.create({
-                owner, repo, title, body,
+                owner, repo,
+                title, body,
                 labels: ['security', label]
               });
             }
