@@ -1,3 +1,4 @@
+# .github/workflows/security-compliance.yml
 name: Security Compliance Report
 
 on:
@@ -20,25 +21,35 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ── 0. Checkout & setup Python/Node ─────────────────────────
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
-      - uses: actions/setup-python@v4
-        with: { python-version: "3.x" }
-      - uses: actions/setup-node@v4
-        with: { node-version: "20" }
+      # ── 0. Checkout & setup runtimes ───────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      # ── 1. Semgrep SAST (TS + custom Nest rules) ─────────────────
+      - name: Setup Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: "3.10"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # ── 1. Semgrep SAST (TS + custom rules) ────────────────────
       - name: Install Semgrep
-        run: pip install semgrep
-
-      - name: Semgrep SAST
         run: |
-          # scan your source dir
+          python -m pip install --upgrade pip
+          pip install semgrep
+
+      - name: Run Semgrep on src/
+        run: |
           semgrep \
             --config p/security \
             --config .semgrep.yml \
             --sarif --output semgrep.sarif \
+            --exit-zero \
             src
 
       # ── 2. TruffleHog secret scan ────────────────────────────────
@@ -47,29 +58,30 @@ jobs:
 
       - name: TruffleHog scan for secrets
         continue-on-error: true
-        run: trufflehog filesystem --json --repo_path . > trufflehog.json || true
+        run: trufflehog filesystem --json --repo_path . > trufflehog.json
 
       - name: Upload TruffleHog results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         if: always()
         with:
           name: trufflehog-results
           path: trufflehog.json
 
       # ── 3. Dependency review ─────────────────────────────────────
-      - uses: actions/dependency-review-action@v2
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v2
 
-      # ── 4. Trivy FS scan (OS + npm) ─────────────────────────────
+      # ── 4. Trivy filesystem scan ────────────────────────────────
       - name: Install Trivy
         run: |
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sh -s -- -b ~/.local/bin v0.64.1
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
-      - name: Trivy filesystem scan
+      - name: Trivy FS scan
         run: trivy fs --format sarif --output trivy-fs.sarif .
 
-      # ── 5. Trivy IaC scan (Terraform) ───────────────────────────
+      # ── 5. Trivy IaC scan ───────────────────────────────────────
       - name: Trivy IaC scan
         run: |
           if [ -d infra/terraform ]; then
@@ -81,6 +93,7 @@ jobs:
       # ── 6. Trivy container image scan ──────────────────────────
       - name: Build Docker image
         run: docker build -t app:${{ github.sha }} .
+
       - name: Trivy image scan
         run: trivy image --format sarif --output trivy-img.sarif app:${{ github.sha }}
 
@@ -89,12 +102,13 @@ jobs:
         run: |
           jq -s '{version:"2.1.0", runs: [.[].runs[]]}' \
             semgrep.sarif \
+            trufflehog.json || true \
             trivy-fs.sarif \
             trivy-iac.sarif \
             trivy-img.sarif \
           > merged.sarif
 
-      # ── 8. Extract only HIGH/CRITICAL findings ──────────────────
+      # ── 8. Extract HIGH/CRITICAL findings ───────────────────────
       - name: Extract findings
         id: findings
         run: |
@@ -106,7 +120,7 @@ jobs:
           | sort -u > findings.txt
           echo "found=$(wc -l < findings.txt)" >> $GITHUB_OUTPUT
 
-      # ── 9. Open one issue per file with bullets ────────────────
+      # ── 9. Open grouped issues per file ────────────────────────
       - name: Open issues for new findings
         uses: actions/github-script@v7
         with:
@@ -116,58 +130,51 @@ jobs:
                   path = require('path'),
                   cwd  = process.cwd();
 
-            // Group findings by file
+            // 1) Read & group findings by file
             const groups = {};
             for (let raw of fs.readFileSync('findings.txt','utf8').split('\n').filter(Boolean)) {
-              raw = raw
-                .replace(/^file:\/\/[^|]+/, '')
-                .replace(new RegExp(`^${cwd}`), '');
+              raw = raw.replace(/^file:\/\/[^|]+/, '').replace(new RegExp(`^${cwd}`), '');
               const [tool, ruleId, rawFile, lineAndSev] = raw.split('|||');
               if (![tool,ruleId,rawFile,lineAndSev].every(Boolean)) continue;
-              const [lineNum, sevRaw] = lineAndSev.split('//');
+              let [lineNum, sevRaw] = lineAndSev.split('//');
               const severity = sevRaw.toLowerCase();
-              let file = rawFile.replace(/^(\.\/|\/)+/, '');
+              let file = rawFile.replace(/^(\.\/|\/)+/,'');
               if (!file.includes('.') || file.includes('node_modules')) continue;
 
-              // locate under root/src/lib/infra/terraform
               let full = path.join(cwd, file);
               if (!fs.existsSync(full)) {
                 for (const pfx of ['src','lib','infra/terraform']) {
                   const alt = path.join(cwd, pfx, file);
-                  if (fs.existsSync(alt)) {
-                    file = `${pfx}/${file}`;
-                    full = alt;
-                    break;
-                  }
+                  if (fs.existsSync(alt)) { file = `${pfx}/${file}`; full = alt; break; }
                 }
               }
               if (!fs.existsSync(full)) continue;
 
-              groups[file] = groups[file]||[];
+              groups[file] = groups[file] || [];
               groups[file].push({ tool, ruleId, lineNum, severity });
             }
 
             const { owner, repo } = context.repo,
-                  sha            = process.env.GITHUB_SHA;
-            const existing = (await github.rest.issues.listForRepo({
-              owner, repo, state:'open', per_page:100
-            })).data;
+                  sha            = process.env.GITHUB_SHA,
+                  existing       = (await github.rest.issues.listForRepo({
+                    owner, repo, state:'open', per_page:100
+                  })).data;
 
+            // 2) One issue per file
             for (const [file, finds] of Object.entries(groups)) {
               const label = finds.some(f=>f.severity==='critical') ? 'critical' : 'high';
               if (existing.find(i=>
-                i.title.includes(file) &&
-                i.labels.some(l=>l.name===label)
+                i.title.includes(file) && i.labels.some(l=>l.name===label)
               )) continue;
 
-              const baseUrl = `https://github.com/${owner}/${repo}/blob/${sha}/${encodeURI(file)}`;
-              const bullets = finds.map(f=>
-                `- [L${f.lineNum}](${baseUrl}#L${f.lineNum}): **${f.ruleId}** (${f.tool}/${f.severity})`
-              ).join('\n');
+              const baseUrl = `https://github.com/${owner}/${repo}/blob/${sha}/${encodeURI(file)}`,
+                    bullets = finds.map(f=>
+                      `- [L${f.lineNum}](${baseUrl}#L${f.lineNum}): **${f.ruleId}** (${f.tool}/${f.severity})`
+                    ).join('\n');
 
               const title = `[${label.toUpperCase()}] Security findings in ${file}`;
               const body  = [
-                `Detected the following **${label.toUpperCase()}** issues in \`${file}\``,
+                `Detected the following **${label.toUpperCase()}** issues in \`${file}\`:`,
                 '',
                 bullets,
                 '',
@@ -176,8 +183,7 @@ jobs:
 
               console.log('➤ Creating issue:', title);
               await github.rest.issues.create({
-                owner, repo,
-                title, body,
+                owner, repo, title, body,
                 labels: ['security', label]
               });
             }
