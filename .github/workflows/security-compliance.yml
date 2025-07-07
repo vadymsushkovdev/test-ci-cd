@@ -23,6 +23,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -54,9 +55,9 @@ jobs:
             trivy-project.sarif \
             trivy-image.sarif \
             trivy-iac.sarif \
-            > merged.sarif
+          > merged.sarif
 
-      # ── 3. Extract HIGH/CRITICAL findings with "|||" delimiter ─
+      # ── 3. Extract HIGH/CRITICAL findings with unambiguous delimiter ─
       - name: Extract High/Critical results
         id: findings
         run: |
@@ -76,7 +77,7 @@ jobs:
           script: |
             const fs   = require('fs');
             const path = require('path');
-            const lines = fs.readFileSync('findings.txt', 'utf8')
+            const lines = fs.readFileSync('findings.txt','utf8')
               .trim().split('\n').filter(Boolean);
 
             const { owner, repo } = context.repo;
@@ -84,58 +85,60 @@ jobs:
 
             // Fetch all open issues once
             const { data: issues } = await github.rest.issues.listForRepo({
-              owner,
-              repo,
-              state: 'open',
-              per_page: 100
+              owner, repo, state: 'open', per_page: 100
             });
 
             for (const line of lines) {
-              // split on our custom delimiter
+              // 1) Split into [ruleId, rawFile, lineAndSev]
               const parts = line.split('|||');
-              if (parts.length < 4) {
-                console.log(`❌ malformed line, skipping: ${line}`);
+              if (parts.length !== 3) {
+                console.log(`❌ malformed entry, skipping: ${line}`);
                 continue;
               }
-              const [ruleId, rawFile, lineNum, severityRaw] = parts;
-              if (!severityRaw) {
-                console.log(`❌ missing severity, skipping: ${line}`);
+              const [ruleId, rawFile, lineAndSev] = parts;
+
+              // 2) Split lineAndSev into [lineNum, severityRaw]
+              const ls = lineAndSev.split('//');
+              if (ls.length !== 2) {
+                console.log(`❌ malformed line//sev, skipping: ${lineAndSev}`);
                 continue;
               }
+              const [lineNum, severityRaw] = ls;
               const severity = severityRaw.toUpperCase();
               const sev = severity.toLowerCase();
 
-              // Normalize path (remove leading "./" or "/")
+              // 3) Normalize path
               const file = rawFile.replace(/^(\.\/|\/+)/, '');
 
-              // Skip non-code artifacts
+              // 4) Skip non-code artifacts
               if (!file.includes('.')) {
                 console.log(`⚠️ skipping non-code artifact: ${file}`);
                 continue;
               }
 
-              // Verify the file exists in the workspace
+              // 5) Verify the file exists locally
               const fullPath = path.join(process.cwd(), file);
               if (!fs.existsSync(fullPath)) {
                 console.log(`❌ file not found, skipping: ${file}`);
                 continue;
               }
 
-              // Skip if an issue already exists for this rule+file+severity
-              const already = issues.some(issue =>
+              // 6) Avoid duplicate issues
+              const exists = issues.some(issue =>
                 issue.title.includes(ruleId) &&
                 issue.title.includes(file) &&
                 issue.labels.some(l => l.name === sev)
               );
-              if (already) {
-                console.log(`✔️ issue exists for ${ruleId} in ${file}`);
+              if (exists) {
+                console.log(`✔️ issue already exists for ${ruleId} in ${file}`);
                 continue;
               }
 
-              // Build GitHub URL to the exact line
+              // 7) Construct GitHub file URL
               const encoded = encodeURI(file);
               const fileUrl = `https://github.com/${owner}/${repo}/blob/${sha}/${encoded}#L${lineNum}`;
 
+              // 8) Create the issue
               const title = `[Security Compliance] [${severity}] ${ruleId} in ${file}:${lineNum}`;
               const body = `
               A new **${severity}** finding was detected by your Security Compliance workflow.
@@ -146,12 +149,10 @@ jobs:
               
               Download the merged SARIF artifact from this workflow run for full context.
               `;
-              
-              console.log(`🚀 opening issue for ${file}:${lineNum}`);
+            console.log(`🚀 opening issue: ${title}`);
               await github.rest.issues.create({
               owner, repo,
               title, body,
             labels: ['security', sev]
             });
               }
-
