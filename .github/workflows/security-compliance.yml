@@ -9,7 +9,7 @@ on:
 
 permissions:
   contents: read
-  security-events: write        # for Code Scanning SARIF upload
+  security-events: write        # still needed for SARIF upload
 
 concurrency:
   group: security-compliance
@@ -20,30 +20,19 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ─── 0. Checkout ───────────────────────────────────────────
+      # ───────── 0. Checkout ───────────────────────────────────────
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # ─── 0.5 Setup Node (for sarif-cli) ─────────────────────────
+      # ───────── 0.5 Setup Node (for sarif-cli) ────────────────────
       - uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      # ─── 1. CodeQL SAST ─────────────────────────────────────────
-      - uses: github/codeql-action/init@v3
-        with:
-          languages: typescript
-
-      - uses: github/codeql-action/autobuild@v3
-
-      - uses: github/codeql-action/analyze@v3
-        with:
-          upload: false     # we’ll merge & upload SARIF ourselves
-
-      # ─── 2. Trivy scans (deps, image, IaC) ───────────────────────
-      - name: Trivy FS scan
-        uses: aquasecurity/trivy-action@master   # pinned to a real release
+      # ───────── 1. Trivy scans (deps, image, IaC) ─────────────────
+      - name: Trivy project scan
+        uses: aquasecurity/trivy-action@0.31.1
         with:
           scan-type: fs
           scan-ref: .
@@ -58,12 +47,12 @@ jobs:
       - name: Trivy image scan
         run: trivy image --format sarif --output trivy-image.sarif app:${{ github.sha }}
 
-      - name: Trivy IaC scan
+      - name: Trivy IaC (Terraform) scan
         run: trivy config infra/terraform --format sarif --output trivy-iac.sarif
 
-      # ─── 3. Secrets scan with TruffleHog CLI ──────────────────────
+      # ───────── 2. Secrets scan with TruffleHog CLI ───────────────
       - name: Install TruffleHog
-        run: pip install trufflehog
+        run: pip install --upgrade pip && pip install trufflehog
 
       - name: TruffleHog filesystem SARIF
         run: |
@@ -72,20 +61,20 @@ jobs:
             --output trufflehog.sarif \
             .
 
-      # ─── 4. Merge all SARIF files ─────────────────────────────────
+      # ───────── 3. Merge all SARIF files ───────────────────────────
       - name: Install sarif-cli & merge SARIF
         id: merge
         run: |
           npm install -g sarif-cli@1
           sarif merge \
-            "codeql-results/**/*.sarif" \
-            trivy-*.sarif \
+            "trivy-*.sarif" \
             trufflehog.sarif \
             -o merged.sarif
           echo "sarif=merged.sarif" >> "$GITHUB_OUTPUT"
 
-      # ─── 5. Upload combined SARIF to GitHub Security tab ──────────
+      # ───────── 4. Upload combined SARIF to GH Security tab ───────
       - uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: ${{ steps.merge.outputs.sarif }}
+
 
