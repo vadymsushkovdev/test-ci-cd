@@ -70,19 +70,25 @@ jobs:
           path: trufflehog.json
 
       # ───────── 3. Merge SARIF files (Trivy only) ───────────────
-      - name: Merge Trivy SARIF with jq
+      - name: Merge Trivy SARIF
         id: merge
         run: |
-          # Combine SARIF 'runs' arrays from each file into a single SARIF
           jq -s '{version:"2.1.0", runs: [.[].runs[]]}' \
             trivy-project.sarif trivy-image.sarif trivy-iac.sarif \
             > merged.sarif
           echo "sarif=merged.sarif" >> "$GITHUB_OUTPUT"
 
-      # ─── 4. Upload combined SARIF to GitHub Security tab ──
-      - uses: github/codeql-action/upload-sarif@v3
+      # ─── 4. Upload merged SARIF to Code Scanning API ────────────
+      - name: Upload SARIF to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
         with:
           sarif_file: ${{ steps.merge.outputs.sarif }}
+
+      - name: Post-enable-code-scanning notice
+        if: failure() && steps.merge.outcome == 'success'
+        run: |
+          echo "::warning::The SARIF upload step failed—make sure Code Scanning is enabled in Settings → Security → Code scanning and analysis."
 
 
 
