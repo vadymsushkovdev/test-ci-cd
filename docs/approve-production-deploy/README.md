@@ -1,11 +1,8 @@
-# CI / CD Manual‑Approval Pattern (GitHub Actions + AWS SES)
+# CI / CD Manual‑Approval Gate (GitHub Actions)
 
-This repository is a **plug‑and‑play blueprint** that adds a human “ship gate” to any production branch:
+This repo is a **ready‑to‑drop‑in template** that adds a human “ship gate” to your production branch. One workflow file (`approval-check.yml`) opens a GitHub Issue showing the exact commits that will be deployed and pauses the pipeline until an approver comments **approved** or **denied**.
 
-- `approval-check.yml` ‑ opens an approval issue that lists the exact commits about to be deployed and pauses the workflow until an approver says **approved/denied**.
-- `approval-issue-email.yml` ‑ instantly e‑mails the approvers (or any distribution list) when that issue is opened.
-
-> **Why?** — Gives you the safety of a change‑log review plus an out‑of‑band ping, with minimal boilerplate and least‑privilege AWS access.
+> **Why?** — Gives you a quick, auditable checkpoint between “merge to main” and “deploy to prod”, using only built‑in GitHub features—no extra services, no outgoing e‑mail setup.
 
 ---
 
@@ -14,138 +11,79 @@ This repository is a **plug‑and‑play blueprint** that adds a human “ship g
 ```text
 .github/
 └── workflows/
-    ├── approval-check.yml          # main job – creates Issue & waits
-    └── approval-issue-email.yml    # notifier – sends e‑mail via SES
+    └── approval-check.yml          # main job – creates Issue & waits
 ```
 
 ---
 
 ## 2  Prerequisites
 
-| Requirement                          | Why it matters                                                              | Quick check                                        |
-| ------------------------------------ | --------------------------------------------------------------------------- | -------------------------------------------------- |
-| **GitHub Actions enabled**           | runs the workflows                                                          | Settings → Actions → General                       |
-| **AWS SES – Prod access**            | sends e‑mail to any address                                                 | SES console → Account dashboard – Status ✔         |
-| **Verified identity**                | the `From:` address (`ci@example.com`) must be a verified domain or mailbox | SES console → Verified identities – ✔              |
-| **Outbound port 587 or 465 allowed** | runner must reach `email-smtp.<region>.amazonaws.com`                       | `nc -vz email-smtp.eu-central-1.amazonaws.com 587` |
+| Requirement                                      | Why it matters             | Quick check                    |
+| ------------------------------------------------ | -------------------------- | ------------------------------ |
+| **GitHub Actions enabled**                       | runs the workflow          | Settings → Actions → General   |
+| **Repo owner has email or web notifications ON** | so approvers see the Issue | GitHub profile → Notifications |
+
+> *If approvers have disabled issue notifications, make sure they watch the repo or rely on another alerting channel.*
 
 ---
 
-## 3  AWS Setup (one‑time)
+## 3  Workflow‑internal Logic (`approval-check.yml`)
 
-\### 3.1  Create an IAM sender user (least‑privilege)
+| Step                                    | What it does                                                                                                     |
+| --------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| **checkout**                            | Fetches full history so we can diff commits.                                                                     |
+| **Collect commit list (github‑script)** | Compares `HEAD` of the push with the previous commit (`payload.before`). Produces a neat bullet list of commits. |
+| **manual‑approval action**              | Opens an Issue titled `[deploy‑approval] Production deploy <sha>` that:                                          |
 
-1. **IAM → Users → Add user**\
-   *User name*: `ses-smtp-ci-bot`\
-   *Access type*: **Programmatic access**
-2. Skip permissions for now.
-3. **Create user**, download the *Access key ID* & *Secret access key*.
-4. Attach this inline policy (replace account, region, identities):
+1. embeds the commit list
+2. assigns/mentions the approvers you list
+3. blocks the job until an approver comments `approved` (or a denial word). |
 
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": "ses:SendRawEmail",
-      "Resource": [
-        "arn:aws:ses:eu-central-1:123456789012:identity/example.com",
-        "arn:aws:ses:eu-central-1:123456789012:identity/ci@example.com"
-      ]
-    }
-  ]
-}
-```
+### Key inputs to tweak
 
-\### 3.2  Generate SMTP credentials in the console
-
-SES → **SMTP settings** → *Create SMTP credentials* → choose the user you just created → *Create*.\
-Copy the **SMTP username** & **SMTP password** shown **once**.
-
-> These are **not** the IAM keys; SES hashes them for SMTP.
+| Where                        | Name                                                 | Description                                                                                   |
+| ---------------------------- | ---------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `on.push.branches`           | target branches                                      | Default = `main`. Change if your prod branch differs.                                         |
+| `approvers`                  | comma‑separated GitHub usernames or `org/team‑slug`s | People/teams allowed to approve.                                                              |
+| `issue‑title` / `issue‑body` | free text                                            | Keep the `<!-- deploy‑approval -->` marker if you build other automations that search for it. |
+| `minimum‑approvals`          | integer                                              | `1` by default. Increase for multi‑sign‑off.                                                  |
 
 ---
 
-## 4  GitHub Secrets
+## 4  How to Use
 
-| Secret key                | Value                                         |
-| ------------------------- | --------------------------------------------- |
-| `SMTP_USER`               | *SMTP username* (starts with `AKIA…`/`ASIA…`) |
-| `SMTP_PASS`               | *SMTP password* (44‑char base64)              |
-| (*optional*) `RECIPIENTS` | Comma‑separated e‑mail list                   |
-
-Add via **Settings → Secrets and variables → Actions → New secret**.
-
----
-
-## 5  Workflow Files – How They Work
-
-\### 5.1  `approval-check.yml`
-
-- **Triggers**: push to `main` or manual *Run workflow*.
-- **Steps**
-    1. Checkout full history.
-    2. Compare `HEAD` against `payload.before` (or HEAD’s parent) to build a neat commit list.
-    3. Run [`trstringer/manual-approval`](https://github.com/trstringer/manual-approval) which:
-        - Opens an Issue titled `[deploy-approval] Production deploy <sha>` with a hidden marker `<!-- deploy-approval -->`.
-        - Assigns your approver(s) and pauses until they comment **approved**/**denied**.
-- **Customise**\
-  *`approvers`*: GitHub usernames or team slugs\
-  *`branches`*: update the `on.push.branches` array\
-  *`issue-title`****/****`body`*: free‑text, keep the marker if you rely on it elsewhere.
-
-\### 5.2  `approval-issue-email.yml`
-
-- **Trigger**: GitHub `issues` event (type `opened`).
-- **Filter**: runs **only** if:
-    - Issue author == `github-actions[bot]` **and**
-    - Body contains `<!-- deploy-approval -->`.
-- **Action**: [`dawidd6/action-send-mail`](https://github.com/dawidd6/action-send-mail) sends an HTML/text mail via SES.
-- **Customise**\
-  `from`: change display name/address (must match a verified identity)\
-  `to`: static list or `${{ secrets.RECIPIENTS }}`\
-  `server_address`: choose your SES region\
-  `server_port`: `587` (STARTTLS) or `465` (TLS‑wrapper).
+1. **Copy** `approval-check.yml` into `.github/workflows/` of your repository.
+2. Commit & push (or click *Run workflow* → *Run*).
+3. On every push to `main`:
+    1. Workflow opens an Issue and assigns approvers.
+    2. GitHub automatically mails / notifies those users.
+    3. The pipeline pauses until someone comments `approved` (or a denial word). You can chain your deploy steps **after** the manual‑approval step so they run only when approved.
 
 ---
 
-## 6  End‑to‑End Setup Steps
+## 5  Extending the Pattern
 
-1. **Fork / clone** this repo.
-2. Follow **AWS Setup** (Section 3) and **GitHub Secrets** (Section 4).
-3. Commit or copy both workflow files into `.github/workflows/` of your target repo.
-4. Push a dummy commit to `main` (or click *Run workflow* on `approval-check`).
-5. Check:
-    - Issue appears in *Issues* tab, assigned to approver.
-    - Approver mail received.
-    - Comment `approved` — the workflow resumes; comment `denied` — it cancels.
+| Goal                                       | How                                                                                                                                             |
+| ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Deploy after approval**                  | Add your deploy job/steps **after** the `manual-approval` step in the same job, or in a downstream job that needs it.                           |
+| **Multiple environments**                  | Duplicate the job with filters like `branches: [staging]`, different approvers, etc.                                                            |
+| **External alerts (e.g. Slack, SES mail)** | Add a second workflow triggered by `issues.opened` that filters for the `<!-- deploy‑approval -->` marker and posts to your chat/e‑mail system. |
 
 ---
 
-## 7  Troubleshooting
+## 6  Troubleshooting
 
-| Symptom                                                            | Likely cause                            | Remedy                                                                                                          |
-| ------------------------------------------------------------------ | --------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| **Approval Issue created but no e‑mail**                           | Wrong SMTP creds / port blocked         | Test with `openssl s_client -starttls smtp -connect email-smtp.eu-central-1.amazonaws.com:587` or use port 465. |
-| **Workflow fails: 403 ‑ “Resource not accessible by integration”** | Workflow token lacks *issues*\*:write\* | The file already sets `permissions.issues: write`; double‑check repo settings.                                  |
-| **CLI ****\`\`**** not found**                                     | AWS CLI < 2.31                          | Use console wizard or upgrade CLI.                                                                              |
-
----
-
-## 8  Extending This Blueprint
-
-- **Deploy after approval** – append deploy steps *after* the `manual-approval` step. They run only if approved.
-- **Multiple environments** – duplicate the job with different approver lists / branches.
-- **Slack or Teams alerts** – swap `action-send-mail` with a chat‑ops action.
+| Symptom                                                         | Likely cause                       | Fix                                                                                   |
+| --------------------------------------------------------------- | ---------------------------------- | ------------------------------------------------------------------------------------- |
+| Workflow fails with `Resource not accessible by integration`    | `issues: write` permission missing | File already sets it; ensure repo / org policy doesn’t override.                      |
+| Issue opens but pipeline never resumes after `approved` comment | Comment text not matched           | Use one of the default words `approved`, `approve`, `lgtm`, `yes` (case‑insensitive). |
+| Approvers don’t get e‑mails                                     | They disabled GitHub notifications | Check their Notification settings or add an external alert workflow.                  |
 
 ---
 
-## 9  References
+## 7  References
 
-- GitHub Actions manual‑approval action: [https://github.com/trstringer/manual-approval](https://github.com/trstringer/manual-approval)
-- Send mail action: [https://github.com/dawidd6/action-send-mail](https://github.com/dawidd6/action-send-mail)
-- AWS SES SMTP endpoints: [https://docs.aws.amazon.com/ses/latest/dg/send-email-smtp.html](https://docs.aws.amazon.com/ses/latest/dg/send-email-smtp.html)
-- AWS minimal `SendRawEmail` policy: [https://docs.aws.amazon.com/ses/latest/dg/using-ses-iam.html#using-iam-permissions](https://docs.aws.amazon.com/ses/latest/dg/using-ses-iam.html#using-iam-permissions)
-- RFC 6409 (port 587): [https://www.rfc-editor.org/rfc/rfc6409](https://www.rfc-editor.org/rfc/rfc6409)
+- **manual‑approval action** – [https://github.com/trstringer/manual-approval](https://github.com/trstringer/manual-approval)
+- **GitHub docs: job permissions** – [https://docs.github.com/actions/using-jobs/assigning-permissions-to-jobs](https://docs.github.com/actions/using-jobs/assigning-permissions-to-jobs)
+- **Commit comparison API** – [https://docs.github.com/rest/repos/commits#compare-two-commits](https://docs.github.com/rest/repos/commits#compare-two-commits)
 
