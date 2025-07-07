@@ -112,7 +112,7 @@ jobs:
               }
 
               const fileUrl = `https://github.com/${owner}/${repo}/blob/${sha}/${file}#L${lineNum}`;
-              const title = `[${severity}] ${ruleId} in ${file}:${lineNum}`;
+              const title = `[Security Compliance ${severity}] ${ruleId} in ${file}:${lineNum}`;
               const body = `
               A new **${severity}** finding was detected by your Security Compliance workflow.
             
