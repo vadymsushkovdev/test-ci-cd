@@ -1,0 +1,52 @@
+name: Approval Check
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:                  # don't need parallel execution for prod
+  group: prod
+  cancel-in-progress: false
+
+jobs:
+  wait-approval:
+    name: Approval Deployment
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Collect commit list
+        id: commits
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const base = 'main';                
+            const head = process.env.GITHUB_SHA;
+            const { owner, repo } = context.repo;
+  
+            const res = await github.rest.repos.compareCommits({
+              owner, repo, base, head
+            });
+  
+            const list = res.data.commits.map(c =>
+              `- ${c.sha.slice(0,7)}  ${c.commit.message.split('\n')[0]} (@${c.author?.login ?? c.commit.author.name})`
+            ).join('\n');
+  
+            core.setOutput('changes', list);
+
+      - uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ secrets.GITHUB_TOKEN }}
+          approvers: vadymsushkovdev        # comma-separated list/team
+          minimum-approvals: 1
+          fail-on-denial: true
+          issue-title: "Production deploy ${{ github.sha }}"
+          issue-body: |
+             **Changes that will be deployed to production** 
+  
+            ${{ steps.commits.outputs.changes }}
