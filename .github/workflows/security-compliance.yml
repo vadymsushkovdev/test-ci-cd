@@ -5,30 +5,32 @@ on:
   push:
     branches: [main]
   schedule:
-    - cron: '*/5 * * * *'      # every 5 min
+    - cron: '*/5 * * * *'        # every 5 minutes (UTC)
 
 permissions:
   contents: read
-  security-events: write
+  security-events: write        # for Code Scanning SARIF upload
 
 concurrency:
   group: security-compliance
-  cancel-in-progress: true
+  cancel-in-progress: true      # kill in-flight if a new run starts
 
 jobs:
   scan:
     runs-on: ubuntu-latest
 
     steps:
+      # ─── 0. Checkout ───────────────────────────────────────────
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      # ─── 0.5 Setup Node (for sarif-cli) ─────────────────────────
       - uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      # ───────── CodeQL ────────────────────────────────────────────
+      # ─── 1. CodeQL SAST ─────────────────────────────────────────
       - uses: github/codeql-action/init@v3
         with:
           languages: typescript
@@ -36,11 +38,12 @@ jobs:
       - uses: github/codeql-action/autobuild@v3
 
       - uses: github/codeql-action/analyze@v3
-        with: { upload: false }
+        with:
+          upload: false     # we’ll merge & upload SARIF ourselves
 
-      # ───────── Trivy (deps / image / IaC) ────────────────────────
+      # ─── 2. Trivy scans (deps, image, IaC) ───────────────────────
       - name: Trivy FS scan
-        uses: aquasecurity/trivy-action@main      # <-- branch, never disappears
+        uses: aquasecurity/trivy-action@master   # pinned to a real release
         with:
           scan-type: fs
           scan-ref: .
@@ -58,15 +61,19 @@ jobs:
       - name: Trivy IaC scan
         run: trivy config infra/terraform --format sarif --output trivy-iac.sarif
 
-      # ───────── TruffleHog (secrets) ──────────────────────────────
-      - name: TruffleHog secrets scan
-        uses: trufflesecurity/trufflehog-actions-scan@main   # <-- branch
-        with:
-          sarif: trufflehog.sarif
-          branch: ${{ github.sha }}
+      # ─── 3. Secrets scan with TruffleHog CLI ──────────────────────
+      - name: Install TruffleHog
+        run: pip install trufflehog
 
-      # ───────── Merge & upload SARIF ──────────────────────────────
-      - name: Merge SARIF files
+      - name: TruffleHog filesystem SARIF
+        run: |
+          trufflehog filesystem \
+            --format sarif \
+            --output trufflehog.sarif \
+            .
+
+      # ─── 4. Merge all SARIF files ─────────────────────────────────
+      - name: Install sarif-cli & merge SARIF
         id: merge
         run: |
           npm install -g sarif-cli@1
@@ -77,6 +84,8 @@ jobs:
             -o merged.sarif
           echo "sarif=merged.sarif" >> "$GITHUB_OUTPUT"
 
+      # ─── 5. Upload combined SARIF to GitHub Security tab ──────────
       - uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: ${{ steps.merge.outputs.sarif }}
+
