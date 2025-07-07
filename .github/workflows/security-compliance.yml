@@ -50,17 +50,15 @@ jobs:
       - name: Trivy IaC scan
         run: trivy config infra/terraform --format sarif --output trivy-iac.sarif
 
-      # ───────── 2. TruffleHog (JSON-only) ───────────────────────
+      # ───────── 2. TruffleHog JSON scan ─────────────────────────
       - name: Install TruffleHog
         run: |
           python3 -m pip install --upgrade pip
           pip install trufflehog
 
-      - name: Run TruffleHog and save JSON
+      - name: Run TruffleHog local JSON scan
         run: |
-          trufflehog filesystem \
-            --json \
-            . > trufflehog.json
+          trufflehog --json --repo_path . > trufflehog.json
 
       # ───────── 3. Merge SARIF files ────────────────────────────
       - name: Install sarif-cli & merge SARIF
