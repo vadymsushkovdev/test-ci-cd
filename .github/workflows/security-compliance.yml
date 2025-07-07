@@ -83,8 +83,7 @@ jobs:
             const fs = require('fs');
             const lines = fs.readFileSync('findings.txt', 'utf8')
               .trim().split('\n').filter(Boolean);
-            const { owner, repo } = context.repo;
-
+            const { owner, repo, sha } = context;
             for (const line of lines) {
               const [ruleId, file, lineNum, severity] = line.split(/[\|\/]+/);
               const sev = severity.toLowerCase();
@@ -100,16 +99,20 @@ jobs:
                 continue;
               }
 
+              // Build link to the vulnerable line in this run's commit
+              const fileUrl = `https://github.com/${owner}/${repo}/blob/${sha}/${file}#L${lineNum}`;
+
               // Create a new issue
-              const title = `[${severity}] ${ruleId} in ${file}:${lineNum}`;
+              const title = `Security Compliance [${severity}] ${ruleId} in ${file}:${lineNum}`;
               const body = `
               A new **${severity}** finding was detected by your Security Compliance workflow.
             
             - **Rule:** ${ruleId}
-            - **File:** ${file}
+            - **File:** [${file}](${fileUrl})
             - **Line:** ${lineNum}
               
-              Check the workflow run’s merged.sarif artifact for details.`;
+              For full details, download the merged SARIF artifact from this workflow run.
+              `;
               
               await github.rest.issues.create({
               owner, repo,
