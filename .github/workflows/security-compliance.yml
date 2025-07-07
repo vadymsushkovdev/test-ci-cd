@@ -70,7 +70,7 @@ jobs:
           | sort -u > findings.txt
           echo "found=$(wc -l < findings.txt)" >> "$GITHUB_OUTPUT"
 
-      # ── 6. Open issues for new findings ────────────────────
+      # ── 6. Open (grouped) issues for new findings ─────────
       - name: Open issues for new findings
         uses: actions/github-script@v7
         with:
@@ -78,46 +78,23 @@ jobs:
           script: |
             const fs   = require('fs');
             const path = require('path');
-            const lines = fs.readFileSync('findings.txt','utf8')
-              .trim().split('\n').filter(Boolean);
 
-            const { owner, repo } = context.repo;
-            const sha = process.env.GITHUB_SHA;
-
-            // Preload open issues
-            const { data: issues } = await github.rest.issues.listForRepo({
-              owner, repo, state: 'open', per_page: 100
-            });
-
-            for (const line of lines) {
-              // 1) Split into [ruleId, rawFile, lineAndSev]
-              const parts = line.split('|||');
-              if (parts.length !== 3) {
-                console.log(`❌ malformed entry, skipping: ${line}`);
-                continue;
-              }
+            // 1) Read and parse findings into groups by file
+            const groups = {};
+            for (const raw of fs.readFileSync('findings.txt','utf8')
+                                  .trim().split('\n').filter(Boolean)) {
+              const parts = raw.split('|||');
+              if (parts.length !== 3) continue;
               const [ruleId, rawFile, lineAndSev] = parts;
-
-              // 2) Split lineAndSev into [lineNum, severityRaw]
               const ls = lineAndSev.split('//');
-              if (ls.length !== 2) {
-                console.log(`❌ malformed line//sev, skipping: ${lineAndSev}`);
-                continue;
-              }
-              const [lineNum, severityRaw] = ls;
-              const severity = severityRaw.toUpperCase();
-              const sev = severity.toLowerCase();
-
-              // 3) Normalize path
+              if (ls.length !== 2) continue;
+              const [lineNum, sevRaw] = ls;
+              const severity = sevRaw.toUpperCase();
+              // normalize path
               let file = rawFile.replace(/^(\.\/|\/+)/, '');
-
-              // 4) Skip vendored or non-code artifacts
-              if (file.includes('node_modules') || !file.includes('.')) {
-                console.log(`⚠️ skipping artifact: ${file}`);
-                continue;
-              }
-
-              // 5) Verify existence, try infra/terraform fallback
+              // skip vendored or non‐code
+              if (file.includes('node_modules') || !file.includes('.')) continue;
+              // existence or terraform fallback
               let fullPath = path.join(process.cwd(), file);
               if (!fs.existsSync(fullPath)) {
                 const alt = path.join(process.cwd(), 'infra/terraform', file);
@@ -125,41 +102,55 @@ jobs:
                   file = path.posix.join('infra/terraform', file);
                   fullPath = alt;
                 } else {
-                  console.log(`❌ file not found, skipping: ${file}`);
                   continue;
                 }
               }
+              // initialize group
+              groups[file] = groups[file] || [];
+              groups[file].push({ ruleId, lineNum, severity });
+            }
 
-              // 6) Avoid duplicate issues
-              const dup = issues.some(issue =>
-                issue.title.includes(ruleId) &&
-                issue.title.includes(file) &&
-                issue.labels.some(l => l.name === sev)
-              );
-              if (dup) {
-                console.log(`✔️ already have issue for ${ruleId} in ${file}`);
-                continue;
-              }
+            const { owner, repo } = context.repo;
+            const sha = process.env.GITHUB_SHA;
 
-              // 7) Build link to exact line
-              const encoded = encodeURI(file);
-              const fileUrl = `https://github.com/${owner}/${repo}/blob/${sha}/${encoded}#L${lineNum}`;
-
-              // 8) Create the issue
-              const title = `[${severity}] ${ruleId} in ${file}:${lineNum}`;
-              const body = `
-              A new **${severity}** finding was detected by Trivy.
-            
-            - **Rule:** ${ruleId}
-            - **File:** [${file}](${fileUrl})
-            - **Line:** ${lineNum}
-              
-              Download the **merged.sarif** artifact from this workflow run for full context.
-              `;
-            console.log(`🚀 opening issue: ${title}`);
-              await github.rest.issues.create({
-              owner, repo,
-              title, body,
-            labels: ['security', sev]
+            // 2) Preload open issues
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', per_page: 100
             });
-              }
+
+            // 3) For each file group, open one issue
+            for (const [file, findings] of Object.entries(groups)) {
+              // determine highest severity for label
+              const sev = findings.some(f=>f.severity==='CRITICAL')
+                          ? 'critical' : 'high';
+
+              // avoid duplicate: by file and label
+              const exists = issues.some(issue =>
+                issue.title.includes(file) &&
+                issue.labels.some(l=>l.name===sev)
+              );
+              if (exists) continue;
+
+              // build issue body listing all findings
+              const encoded = encodeURI(file);
+              const fileUrlBase = `https://github.com/${owner}/${repo}/blob/${sha}/${encoded}`;
+              const bodyLines = findings.map(f =>
+                `- [L${f.lineNum}](${fileUrlBase}#L${f.lineNum}): **${f.ruleId}** (${f.severity})`
+              ).join('\n');
+
+              const title = `[${sev.toUpperCase()}] Security findings in ${file}`;
+              const body = `
+              The following **${sev.toUpperCase()}** findings were detected by Trivy in \`${file}\`:
+                
+                ${bodyLines}
+                
+                Download the merged SARIF artifact from this workflow run for full details.
+                `;
+              
+              console.log(`🚀 creating issue: ${title}`);
+                await github.rest.issues.create({
+                owner, repo,
+                title, body,
+              labels: ['security', sev]
+              });
+                }
