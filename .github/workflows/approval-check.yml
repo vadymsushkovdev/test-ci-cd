@@ -2,7 +2,7 @@ name: Approval Check
 
 permissions:
   contents: read
-  issues:   write
+  issues:   write               # needed to create the approval Issue
 
 on:
   push:
@@ -45,14 +45,15 @@ jobs:
             core.setOutput('changes', list || '_No code changes in this push_');
 
       - uses: trstringer/manual-approval@v1
+        id: approval
         with:
           secret: ${{ secrets.GITHUB_TOKEN }}
           approvers: vadymsushkovdev
           minimum-approvals: 1
           fail-on-denial: true
-          issue-title: "Production deploy ${{ github.sha }}"
+          issue-title: "[deploy-approval] Production deploy ${{ github.sha }}"
           issue-body: |
+            <!-- deploy-approval -->
             **Changes that will be deployed to production**
 
             ${{ steps.commits.outputs.changes }}
-

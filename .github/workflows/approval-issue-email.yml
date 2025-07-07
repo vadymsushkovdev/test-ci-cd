@@ -1,0 +1,34 @@
+name: Notify approvers when deploy Issue opens
+
+# trigger on every Issue *opening*
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  mail:
+    if: |
+      github.event.issue.user.login == 'github-actions[bot]' &&
+      contains(github.event.issue.body, '<!-- deploy-approval -->')
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: dawidd6/action-send-mail@v6
+        with:
+          server_address: email-smtp.eu-central-1.amazonaws.com
+          server_port: 587
+          secure: true
+          username: ${{ secrets.SMTP_USER }}
+          password: ${{ secrets.SMTP_PASS }}
+          from:    "cekohik735@amgens.com" # Add to secret
+          to:      "vadymsushkovdev@gmail.com" # Add to secret (can be multiple)
+          subject: "${{ github.event.issue.title }}"
+          body: |
+            A production deployment requires manual approval.
+
+            Approvers: ${{ github.event.issue.assignees.*.login }}
+            Issue URL: ${{ github.event.issue.html_url }}
+
+            Preview of changes:
+            ----------------------------------------
+            ${{ github.event.issue.body }}
