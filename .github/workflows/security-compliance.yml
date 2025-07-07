@@ -79,27 +79,44 @@ jobs:
             const fs   = require('fs');
             const path = require('path');
 
-            // 1) Read and group findings by file
+            // Group findings by file
             const groups = {};
-            for (const raw of fs.readFileSync('findings.txt','utf8')
+            for (let raw of fs.readFileSync('findings.txt','utf8')
                                   .trim().split('\n').filter(Boolean)) {
+              // strip any leading file:// URI
+              raw = raw.replace(/^file:\/\/[^|]+/, '');
               const parts = raw.split('|||');
               if (parts.length !== 3) continue;
+
               const [ruleId, rawFile, lineAndSev] = parts;
               const [lineNum, sevRaw] = lineAndSev.split('//');
               const severity = sevRaw.toUpperCase();
-              let file = rawFile.replace(/^(\.\/|\/+)/, '');
+
+              // normalize path
+              let file = rawFile
+                .replace(/^file:\/\/[^/]+\/+/, '')
+                .replace(/^(\.\/|\/)+/, '');
+
+              // skip vendored or non-code
               if (file.includes('node_modules') || !file.includes('.')) continue;
+
+              // try repo root, then src/, then lib/
               let fullPath = path.join(process.cwd(), file);
               if (!fs.existsSync(fullPath)) {
-                const alt = path.join(process.cwd(), 'infra/terraform', file);
-                if (fs.existsSync(alt)) {
-                  file = path.posix.join('infra/terraform', file);
-                  fullPath = alt;
+                const alt1 = path.join(process.cwd(), 'src', file);
+                const alt2 = path.join(process.cwd(), 'lib', file);
+                if (fs.existsSync(alt1)) {
+                  file = path.posix.join('src', file);
+                  fullPath = alt1;
+                } else if (fs.existsSync(alt2)) {
+                  file = path.posix.join('lib', file);
+                  fullPath = alt2;
                 } else {
+                  console.log(`❌ file not found, skipping: ${file}`);
                   continue;
                 }
               }
+
               groups[file] = groups[file] || [];
               groups[file].push({ ruleId, lineNum, severity });
             }
@@ -107,27 +124,26 @@ jobs:
             const { owner, repo } = context.repo;
             const sha = process.env.GITHUB_SHA;
 
-            // 2) Preload open issues
+            // Preload existing open issues
             const { data: issues } = await github.rest.issues.listForRepo({
               owner, repo, state: 'open', per_page: 100
             });
 
-            // 3) For each file group, open one issue
+            // For each file, open a single grouped issue
             for (const [file, findings] of Object.entries(groups)) {
-              // determine label
-              const sev = findings.some(f => f.severity === 'CRITICAL')
+              // pick highest severity label
+              const sev = findings.some(f=>f.severity==='CRITICAL')
                           ? 'critical'
                           : 'high';
 
-              // skip dupes
+              // skip if issue already exists for this file+severity
               if (issues.some(issue =>
                   issue.title.includes(file) &&
-                  issue.labels.some(l => l.name === sev))
-              ) continue;
+                  issue.labels.some(l=>l.name===sev)
+              )) continue;
 
               // build bullets
-              const encoded = encodeURI(file);
-              const baseUrl = `https://github.com/${owner}/${repo}/blob/${sha}/${encoded}`;
+              const baseUrl = `https://github.com/${owner}/${repo}/blob/${sha}/${encodeURI(file)}`;
               const bullets = findings.map(f =>
                 `- [L${f.lineNum}](${baseUrl}#L${f.lineNum}): **${f.ruleId}** (${f.severity})`
               ).join('\n');
