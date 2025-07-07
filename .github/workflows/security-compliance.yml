@@ -1,4 +1,3 @@
-# .github/workflows/security-compliance.yml
 name: Security Compliance Report
 
 on:
@@ -75,7 +74,8 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const fs = require('fs');
+            const fs   = require('fs');
+            const path = require('path');
             const lines = fs.readFileSync('findings.txt', 'utf8')
               .trim().split('\n').filter(Boolean);
 
@@ -90,29 +90,42 @@ jobs:
               per_page: 100
             });
 
-            for (const line of lines) {
-              const [ruleId, file, lineNum, severity] = line.split(/[\|\/]+/);
-              const sev = severity.toLowerCase(); // "HIGH" -> "high"
+            for (let line of lines) {
+              let [ruleId, file, lineNum, severity] = line.split(/[\|\/]+/);
+              const sev = severity.toLowerCase();
 
-              // Skip non‐code artifacts (e.g. "library:app")
+              // Normalize file path: remove leading slashes or "./"
+              file = file.replace(/^(\.\/|\/+)/, '');
+
+              // 1) Skip non-code artifacts
               if (!file.includes('.')) {
-                console.log(`⚠️ skipping non-code artifact ${file}`);
+                console.log(`skipping non-code artifact: ${file}`);
                 continue;
               }
 
-              // Skip if an issue for this (rule + file) already exists
+              // 2) Verify that the file actually exists in the workspace
+              const fullPath = path.join(process.cwd(), file);
+              if (!fs.existsSync(fullPath)) {
+                console.log(`file not found, skipping: ${file}`);
+                continue;
+              }
+
+              // 3) Skip if we already have an open issue for this rule+file
               const already = issues.some(issue =>
                 issue.title.includes(ruleId) &&
                 issue.title.includes(file) &&
                 issue.labels.some(l => l.name === sev)
               );
               if (already) {
-                console.log(`✔️ issue already exists for ${ruleId} in ${file}`);
+                console.log(`issue already exists for ${ruleId} in ${file}`);
                 continue;
               }
 
-              const fileUrl = `https://github.com/${owner}/${repo}/blob/${sha}/${file}#L${lineNum}`;
-              const title = `[Security Compliance ${severity}] ${ruleId} in ${file}:${lineNum}`;
+              // 4) Build a proper GitHub URL to the exact line
+              const encodedPath = encodeURI(file);
+              const fileUrl = `https://github.com/${owner}/${repo}/blob/${sha}/${encodedPath}#L${lineNum}`;
+
+              const title = `Security Compliance [${severity}] ${ruleId} in ${file}:${lineNum}`;
               const body = `
               A new **${severity}** finding was detected by your Security Compliance workflow.
             
@@ -122,8 +135,8 @@ jobs:
               
               For full context, download the merged SARIF artifact from this workflow run.
               `;
-            
-            console.log(`🚀 opening issue: ${title}`);
+              
+              console.log(`opening issue for ${file}:${lineNum}`);
               await github.rest.issues.create({
               owner,
               repo,
