@@ -32,7 +32,7 @@ jobs:
 
       # ───────── 1. Trivy scans (deps, image, IaC) ─────────────────
       - name: Trivy project scan
-        uses: aquasecurity/trivy-action@0.31.1
+        uses: aquasecurity/trivy-action@master
         with:
           scan-type: fs
           scan-ref: .
