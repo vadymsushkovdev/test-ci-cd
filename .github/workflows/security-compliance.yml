@@ -8,8 +8,10 @@ on:
     - cron: '*/5 * * * *'        # every 5 minutes (UTC)
 
 permissions:
-  contents: read
-  security-events: write        # required for SARIF upload
+  contents: read        # still read-only on code
+  security-events: write  # needed for SARIF upload
+  issues: write         # for creating manual-approval issues
+  pull-requests: write  # if you need to open or comment on PRs
 
 concurrency:
   group: security-compliance
