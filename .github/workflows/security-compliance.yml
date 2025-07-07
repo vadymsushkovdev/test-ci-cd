@@ -1,0 +1,82 @@
+# .github/workflows/security-compliance.yml
+name: Security Compliance Report
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '*/5 * * * *'      # every 5 min
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: security-compliance
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # ───────── CodeQL ────────────────────────────────────────────
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: typescript
+
+      - uses: github/codeql-action/autobuild@v3
+
+      - uses: github/codeql-action/analyze@v3
+        with: { upload: false }
+
+      # ───────── Trivy (deps / image / IaC) ────────────────────────
+      - name: Trivy FS scan
+        uses: aquasecurity/trivy-action@main      # <-- branch, never disappears
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-project.sarif
+          severity: CRITICAL,HIGH
+          hide-progress: true
+
+      - name: Build Docker image for scan
+        run: docker build -t app:${{ github.sha }} .
+
+      - name: Trivy image scan
+        run: trivy image --format sarif --output trivy-image.sarif app:${{ github.sha }}
+
+      - name: Trivy IaC scan
+        run: trivy config infra/terraform --format sarif --output trivy-iac.sarif
+
+      # ───────── TruffleHog (secrets) ──────────────────────────────
+      - name: TruffleHog secrets scan
+        uses: trufflesecurity/trufflehog-actions-scan@main   # <-- branch
+        with:
+          sarif: trufflehog.sarif
+          branch: ${{ github.sha }}
+
+      # ───────── Merge & upload SARIF ──────────────────────────────
+      - name: Merge SARIF files
+        id: merge
+        run: |
+          npm install -g sarif-cli@1
+          sarif merge \
+            "codeql-results/**/*.sarif" \
+            trivy-*.sarif \
+            trufflehog.sarif \
+            -o merged.sarif
+          echo "sarif=merged.sarif" >> "$GITHUB_OUTPUT"
+
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ steps.merge.outputs.sarif }}
