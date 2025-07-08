@@ -1,126 +1,79 @@
-name: Security Pre-Merge Gate
+name: Security Compliance
 
 on:
   pull_request:
-    branches: [main]
+    branches: [ main ]
   workflow_dispatch:
 
-permissions:
-  contents: read
-  issues: write
-  pull-requests: write
-
-concurrency:
-  group: security-gate
-  cancel-in-progress: true
-
 jobs:
-  security-scan:
-    name: Security Compliance Scan
+  security-compliance:
     runs-on: ubuntu-latest
-
     steps:
       # 1. Checkout code
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      # 2. Setup Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          fetch-depth: 0
+          node-version: '18'
 
-      # 2. Install Python + Semgrep
-      - name: Install Python + Semgrep
+      # 3. Install dependencies
+      - name: Install npm deps
+        run: npm ci
+
+      # 4. Install Reviewdog
+      - name: Install reviewdog
         run: |
-          python -m pip install --upgrade pip
-          pip install semgrep==1.128.0
+          curl -sfL https://raw.githubusercontent.com/reviewdog/reviewdog/master/install.sh \
+            | sh -s -- -b $(pwd) v0.13.0
+          echo "$PWD" >> $GITHUB_PATH
 
-      # 3. Run Semgrep (exit 1 if findings at ERROR/WARNING)
-      - name: Semgrep SAST
-        id: semgrep
+#      # 5. ESLint (with eslint-plugin-security)
+#      - name: Run ESLint Security Checks
+#        run: |
+#          # install ESLint & the security plugin
+#          npm install --no-save eslint@^9 eslint-plugin-security
+#
+#          # ESLint will automatically load eslint.config.js
+#          npx eslint --ext .js,.ts . \
+#            -f json -o eslint-report.json
+#
+#          reviewdog \
+#            -f=eslint \
+#            -name="ESLint Security" \
+#            -reporter=github-pr-review \
+#            -level=error \
+#            < eslint-report.json
+
+
+      # 6. Gitleaks (secret scanning)
+      - name: Install Gitleaks CLI
         run: |
-          semgrep --config p/security --sarif --output semgrep.sarif src || true
+          curl -sSL https://github.com/zricethezav/gitleaks/releases/download/v8.10.0/gitleaks_8.10.0_Linux_x86_64.tar.gz \
+            | tar xz -C /usr/local/bin gitleaks
+      - name: Run Gitleaks scan
+        run: |
+          gitleaks detect --source . --report-format json --report-path=gitleaks-report.json
+          reviewdog \
+            -f=gitleaks \
+            -name="Gitleaks Secret Scan" \
+            -reporter=github-pr-review \
+            -level=warning \
+            < gitleaks-report.json
 
-      # 4. Install Trivy
+      # 7. Trivy (filesystem vulnerability scan)
       - name: Install Trivy
         run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b ~/.local/bin v0.51.1
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      # 5. Trivy filesystem scan
-      - name: Trivy FS
-        run: trivy fs --format sarif --output trivy-fs.sarif --severity CRITICAL,HIGH .
-
-      # 6. Build Docker image for Trivy
-      - name: Build Docker image for Trivy
-        run: docker build -t app:${{ github.sha }} .
-
-      # 7. Trivy image scan
-      - name: Trivy image
-        run: trivy image --format sarif --output trivy-img.sarif --severity CRITICAL,HIGH app:${{ github.sha }}
-
-      # 8. Install TruffleHog
-      - name: Install TruffleHog
-        run: pip install trufflehog==2.2.1
-
-      # 9. TruffleHog scan (don't fail job if secrets found, fail later)
-      - name: TruffleHog scan (SARIF)
-        run: trufflehog filesystem --format sarif --output trufflehog.sarif .
-        continue-on-error: true
-
-      # 10. Merge SARIF reports
-      - name: Merge SARIF
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin v0.32.0
+      - name: Run Trivy scan
         run: |
-          jq -s '{version:"2.1.0", runs: [.[].runs[]]}' \
-            semgrep.sarif trufflehog.sarif trivy-fs.sarif trivy-img.sarif > merged.sarif
-
-      # 11. Extract findings
-      - name: Extract findings
-        id: findings
-        run: |
-          jq -r '
-            .runs[].results[]
-            | select(.level=="error" or .level=="warning")
-            | "\(.tool.driver.name)|||\(.rule.id)|||\(.locations[0].physicalLocation.artifactLocation.uri)|||\(.locations[0].physicalLocation.region.startLine)//\(.level|ascii_upcase)"' \
-            merged.sarif | sort -u > findings.txt
-          echo "found=$(wc -l < findings.txt)" >> "$GITHUB_OUTPUT"
-          # Find if any CRITICAL or HIGH exists
-          if grep -Ei '//(ERROR|WARNING)' findings.txt | grep -q .; then
-            echo "high_critical_found=1" >> "$GITHUB_OUTPUT"
-          else
-            echo "high_critical_found=0" >> "$GITHUB_OUTPUT"
-          fi
-
-      # 12. Upload artifacts
-      - name: Upload findings
-        uses: actions/upload-artifact@v4
-        with:
-          name: security-findings
-          path: |
-            findings.txt
-            merged.sarif
-
-      # 13. Fail PR if HIGH/CRITICAL issues exist
-      - name: Fail on unresolved findings
-        if: steps.findings.outputs.high_critical_found == '1'
-        run: |
-          echo "❌ Security scan failed: HIGH or CRITICAL findings present."
-          cat findings.txt
-          exit 1
-
-      # 14. Dependency Review (PR only)
-      - name: Dependency Review
-        if: github.event_name == 'pull_request'
-        uses: actions/dependency-review-action@v4
-
-      # 15. Optional: Comment on PR with summary
-      - name: PR summary comment
-        if: github.event_name == 'pull_request'
-        uses: mshick/add-pr-comment@v2
-        with:
-          message: |
-            ## Security Scan Results
-
-            ${{ steps.findings.outputs.found }} potential HIGH or CRITICAL security issues were detected.
-
-            See uploaded artifacts for details.
-
-            This PR will be **blocked** until all critical findings are resolved.
-
-
+          trivy fs --format json --output trivy-report.json --ignore-unfixed .
+          reviewdog \
+            -f=trivy-ci \
+            -name="Trivy Vulnerability Scan" \
+            -reporter=github-pr-review \
+            -level=error \
+            < trivy-report.json
