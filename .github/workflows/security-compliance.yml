@@ -54,16 +54,19 @@ jobs:
       - name: Trivy Image Scan
         run: trivy image --format sarif --output trivy-img.sarif --severity CRITICAL,HIGH app:${{ github.sha }}
 
-      # 8. Install TruffleHog v3
-      - name: Install TruffleHog v3
-        run: pip install trufflehog==3.73.1
+      # 8. Download Trufflehog v3+ binary
+      - name: Download Trufflehog v3
+        run: |
+          curl -L https://github.com/trufflesecurity/trufflehog/releases/latest/download/trufflehog-linux-amd64 -o trufflehog
+          chmod +x trufflehog
 
-      # 9. TruffleHog SARIF scan
-      - name: TruffleHog Filesystem Scan (SARIF)
-        run: trufflehog filesystem --sarif --output trufflehog.sarif .
+      # 9. Run Trufflehog with SARIF output
+      - name: Trufflehog Filesystem Scan (SARIF)
+        run: |
+          ./trufflehog filesystem --sarif --output trufflehog.sarif .
         continue-on-error: true
 
-      # 10. Merge SARIF reports
+      # 10. Merge all SARIF reports
       - name: Merge SARIF reports
         run: |
           jq -s '{version:"2.1.0", runs: [.[].runs[]]}' \
@@ -76,47 +79,4 @@ jobs:
           jq -r '
             .runs[].results[]
             | select(.level=="error" or .level=="warning")
-            | "\(.tool.driver.name)|||\(.rule.id)|||\(.locations[0].physicalLocation.artifactLocation.uri)|||\(.locations[0].physicalLocation.region.startLine)//\(.level|ascii_upcase)"' \
-            merged.sarif | sort -u > findings.txt
-          echo "found=$(wc -l < findings.txt)" >> "$GITHUB_OUTPUT"
-          if grep -Ei '//(ERROR|WARNING)' findings.txt | grep -q .; then
-            echo "high_critical_found=1" >> "$GITHUB_OUTPUT"
-          else
-            echo "high_critical_found=0" >> "$GITHUB_OUTPUT"
-          fi
-
-      # 12. Upload findings as an artifact
-      - name: Upload findings
-        uses: actions/upload-artifact@v4
-        with:
-          name: security-findings
-          path: |
-            findings.txt
-            merged.sarif
-
-      # 13. Fail PR if HIGH/CRITICAL issues exist
-      - name: Fail on unresolved findings
-        if: steps.findings.outputs.high_critical_found == '1'
-        run: |
-          echo "❌ Security scan failed: HIGH or CRITICAL findings present."
-          cat findings.txt
-          exit 1
-
-      # 14. Dependency Review (PR only)
-      - name: Dependency Review
-        if: github.event_name == 'pull_request'
-        uses: actions/dependency-review-action@v4
-
-      # 15. PR summary comment (optional, but good for DX)
-      - name: PR summary comment
-        if: github.event_name == 'pull_request'
-        uses: mshick/add-pr-comment@v2
-        with:
-          message: |
-            ## Security Scan Results
-
-            ${{ steps.findings.outputs.found }} potential HIGH or CRITICAL security issues detected.
-
-            See uploaded artifacts for details.
-
-            This PR will be **blocked** until all critical findings are resolved.
+            | "\(.tool.driver.name)|||\(.rule.id)|||\(.locations[0].physicalLocation.artifactLocation.uri)|||\(.lo
