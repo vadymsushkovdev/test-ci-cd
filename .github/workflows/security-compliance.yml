@@ -2,56 +2,72 @@ name: Security Compliance
 
 on:
   pull_request:
-    branches: [main]
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
-  security-check:
+  security-compliance:
     runs-on: ubuntu-latest
     steps:
+      # 1. Checkout code
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Set up Node.js
+      # 2. Setup Node.js
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '18'
 
-      - name: Install dependencies
+      # 3. Install dependencies
+      - name: Install npm deps
         run: npm ci
 
-      # 1. ESLint (with eslint-plugin-security) via Reviewdog
-      - name: Run ESLint with security plugin
-        uses: reviewdog/action-eslint@v1
-        with:
-          reporter: github-pr-review
-          eslint_flags: |
-            -c .eslintrc.json
-            --ext .js,.jsx,.ts,.tsx
-        env:
-          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # 4. Install Reviewdog
+      - name: Install reviewdog
+        run: |
+          curl -sfL https://raw.githubusercontent.com/reviewdog/reviewdog/master/install.sh \
+            | sh -s -- -b $(pwd) v0.13.0
+          echo "$PWD" >> $GITHUB_PATH
 
-      # 2. Gitleaks (secret scanner) via Reviewdog
-      - name: Scan for secrets with Gitleaks
-        uses: reviewdog/action-gitleaks@v1
-        with:
-          reporter: github-pr-review
-        env:
-          GITLEAKS_CONFIG: .gitleaks.toml
-          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # 5. ESLint (with eslint-plugin-security)
+      - name: ESLint Security Checks
+        run: |
+          npm install --no-save eslint eslint-plugin-security
+          npx eslint --ext .js,.ts . -f json -o eslint-report.json
+          reviewdog \
+            -f=eslint \
+            -name="ESLint Security" \
+            -reporter=github-pr-review \
+            -level=error \
+            < eslint-report.json
 
-      # 3. Trivy (OS & library CVE scan)
-      - name: Scan dependencies & OS packages with Trivy
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          scan-type: fs
-          vulnerability-type: os,library
-          ignore-unfixed: true
+      # 6. Gitleaks (secret scanning)
+      - name: Install Gitleaks CLI
+        run: |
+          curl -sSL https://github.com/zricethezav/gitleaks/releases/download/v8.10.0/gitleaks_8.10.0_Linux_x86_64.tar.gz \
+            | tar xz -C /usr/local/bin gitleaks
+      - name: Run Gitleaks scan
+        run: |
+          gitleaks detect --source . --report-format json --report-path=gitleaks-report.json
+          reviewdog \
+            -f=gitleaks \
+            -name="Gitleaks Secret Scan" \
+            -reporter=github-pr-review \
+            -level=warning \
+            < gitleaks-report.json
 
-      - name: Annotate Trivy findings with Reviewdog
-        uses: reviewdog/action-trivy@v2
-        with:
-          reporter: github-pr-review
-          filter_mode: nofilter
-        env:
-          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # 7. Trivy (filesystem vulnerability scan)
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin v0.32.0
+      - name: Run Trivy scan
+        run: |
+          trivy fs --format json --output trivy-report.json --ignore-unfixed .
+          reviewdog \
+            -f=trivy-ci \
+            -name="Trivy Vulnerability Scan" \
+            -reporter=github-pr-review \
+            -level=error \
+            < trivy-report.json
