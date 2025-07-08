@@ -132,24 +132,36 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
+            const path = require('path');
+
+            // Read findings, filter out trash and group by real files
             const lines = fs.readFileSync('findings.txt', 'utf8')
               .split('\n')
               .filter(Boolean)
-              .filter(line => !/node_modules|\.pnpm|package-lock\.json|unknown|^usr\/|^library\//.test(line));
+              .map(line => {
+                const [tool, ruleId, file, rest] = line.split('|||');
+                const [lineNum, sevRaw] = (rest || '').split('//');
+                return { tool, ruleId, file, lineNum, severity: sevRaw };
+              })
+              .filter(item =>
+                item.file &&
+                !item.file.startsWith('node_modules') &&
+                !item.file.startsWith('library/app') &&
+                !item.file.includes('pnpm') &&
+                !item.file.includes('package-lock') &&
+                !item.file.includes('unknown') &&
+                fs.existsSync(item.file)
+              );
+
             if (!lines.length) return;
 
             const { repo, owner } = context.repo;
             const sha = process.env.GITHUB_SHA;
             const baseUrl = `https://github.com/${owner}/${repo}/blob/${sha}`;
 
-            const parsed = lines.map(line => {
-              const [tool, ruleId, file, rest] = line.split('|||');
-              const [lineNum, sevRaw] = (rest || '').split('//');
-              return { tool, ruleId, file, lineNum, severity: sevRaw };
-            });
-
+            // Group by file
             const grouped = {};
-            for (const item of parsed) {
+            for (const item of lines) {
               if (!grouped[item.file]) grouped[item.file] = [];
               grouped[item.file].push(item);
             }
@@ -157,13 +169,14 @@ jobs:
             let body = `## 🚨 Security Findings (pre-merge required changes)\n\n`;
             body += `**The following files/lines must be reviewed and fixed/justified before this PR can be merged:**\n\n`;
 
-            Object.entries(grouped).forEach(([file, list]) => {
+            for (const [file, list] of Object.entries(grouped)) {
               body += `### \`${file}\`\n`;
-              body += list.map(item =>
-                `- [ ] [Line ${item.lineNum}](${baseUrl}/${file}#L${item.lineNum}) — **${item.ruleId || 'unknown rule'}** detected by ${item.tool}`
-              ).join('\n');
-              body += '\n\n';
-            });
+              for (const item of list) {
+                const url = `${baseUrl}/${file}#L${item.lineNum || 1}`;
+                body += `- [ ] [Line ${item.lineNum || 1}](${url}) — **${item.ruleId || 'unknown rule'}** detected by ${item.tool || 'unknown tool'} (${item.severity || 'unknown'})\n`;
+              }
+              body += '\n';
+            }
 
             body += `> **Why?**  
             > At least one CRITICAL or HIGH security issue was detected in this PR.
@@ -187,6 +200,7 @@ jobs:
                 owner, repo, issue_number: context.issue.number, body: bodyWithTag
               });
             }
+
 
       - name: Fail on unresolved findings
         if: steps.findings.outputs.high_critical_found == '1'
