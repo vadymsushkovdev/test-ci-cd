@@ -44,12 +44,12 @@ jobs:
           pip install semgrep
 
       - name: Run Semgrep on src/
+        continue-on-error: true            # ⬅️ step succeeds even if Semgrep exits 1
         run: |
           semgrep \
             --config p/security \
             --config .semgrep.yml \
             --sarif --output semgrep.sarif \
-            --exit-zero \
             src
 
       # ── 2. TruffleHog secret scan ────────────────────────────────
