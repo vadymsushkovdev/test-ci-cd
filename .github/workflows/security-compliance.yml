@@ -31,16 +31,22 @@ jobs:
           echo "$PWD" >> $GITHUB_PATH
 
       # 5. ESLint (with eslint-plugin-security)
-      - name: ESLint Security Checks
+      - name: Run ESLint Security Checks
         run: |
-          npm install --no-save eslint eslint-plugin-security
-          npx eslint --ext .js,.ts . -f json -o eslint-report.json
+          # install ESLint & the security plugin
+          npm install --no-save eslint@^9 eslint-plugin-security
+          
+          # ESLint will automatically load eslint.config.js
+          npx eslint --ext .js,.ts . \
+            -f json -o eslint-report.json
+          
           reviewdog \
             -f=eslint \
             -name="ESLint Security" \
             -reporter=github-pr-review \
             -level=error \
             < eslint-report.json
+
 
       # 6. Gitleaks (secret scanning)
       - name: Install Gitleaks CLI
