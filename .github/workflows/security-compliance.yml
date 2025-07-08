@@ -20,60 +20,91 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Checkout code
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # 2. Install Python and Semgrep
       - name: Install Python + Semgrep
         run: |
           python -m pip install --upgrade pip
           pip install semgrep==1.128.0
 
-      # 3. Run Semgrep SAST
       - name: Semgrep SAST
         run: |
           semgrep --config p/security --sarif --output semgrep.sarif src || true
 
-      # 4. Install Trivy
       - name: Install Trivy
         run: |
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b ~/.local/bin v0.51.1
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      # 5. Trivy filesystem scan
       - name: Trivy Filesystem Scan
         run: trivy fs --format sarif --output trivy-fs.sarif --severity CRITICAL,HIGH .
 
-      # 6. Build Docker image for Trivy scan
       - name: Build Docker Image for Trivy
         run: docker build -t app:${{ github.sha }} .
 
-      # 7. Trivy image scan
       - name: Trivy Image Scan
         run: trivy image --format sarif --output trivy-img.sarif --severity CRITICAL,HIGH app:${{ github.sha }}
 
-      # 8. Download Trufflehog v3 (binary, proper extraction)
       - name: Download Trufflehog v3
         run: |
           curl -sSL -o trufflehog.tar.gz https://github.com/trufflesecurity/trufflehog/releases/download/v3.77.0/trufflehog_3.77.0_linux_amd64.tar.gz
           tar -xzf trufflehog.tar.gz trufflehog
           chmod +x trufflehog
 
-      # 9. Run Trufflehog with SARIF output
-      - name: Trufflehog Filesystem Scan (SARIF)
+      - name: Trufflehog Filesystem Scan (JSON)
         run: |
-          ./trufflehog filesystem --sarif --output trufflehog.sarif .
+          ./trufflehog filesystem --json . > trufflehog.json
         continue-on-error: true
 
-      # 10. Merge all SARIF reports
+      - name: Convert Trufflehog JSON to SARIF
+        run: |
+          python3 <<EOF
+          import json
+          import sys
+
+          with open('trufflehog.json') as f:
+              findings = [json.loads(line) for line in f if line.strip()]
+
+          sarif = {
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "trufflehog",
+                          "rules": [{
+                              "id": "trufflehog-secret",
+                              "name": "TruffleHog Secret",
+                              "shortDescription": {"text": "Potential secret detected by TruffleHog"}
+                          }]
+                      }
+                  },
+                  "results": [
+                      {
+                          "ruleId": "trufflehog-secret",
+                          "level": "error",
+                          "message": {"text": finding.get("reason", "Secret found")},
+                          "locations": [{
+                              "physicalLocation": {
+                                  "artifactLocation": {"uri": finding.get("path", "unknown")},
+                                  "region": {"startLine": finding.get("start", 1)}
+                              }
+                          }]
+                      }
+                      for finding in findings
+                  ]
+              }]
+          }
+          with open('trufflehog.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
+          EOF
+
       - name: Merge SARIF reports
         run: |
           jq -s '{version:"2.1.0", runs: [.[].runs[]]}' \
             semgrep.sarif trufflehog.sarif trivy-fs.sarif trivy-img.sarif > merged.sarif
 
-      # 11. Extract findings (errors/warnings only)
       - name: Extract findings
         id: findings
         run: |
@@ -89,7 +120,6 @@ jobs:
             echo "high_critical_found=0" >> "$GITHUB_OUTPUT"
           fi
 
-      # 12. Upload findings as an artifact
       - name: Upload findings
         uses: actions/upload-artifact@v4
         with:
@@ -98,7 +128,6 @@ jobs:
             findings.txt
             merged.sarif
 
-      # 13. Fail PR if HIGH/CRITICAL issues exist
       - name: Fail on unresolved findings
         if: steps.findings.outputs.high_critical_found == '1'
         run: |
@@ -106,12 +135,10 @@ jobs:
           cat findings.txt
           exit 1
 
-      # 14. Dependency Review (PR only)
       - name: Dependency Review
         if: github.event_name == 'pull_request'
         uses: actions/dependency-review-action@v4
 
-      # 15. PR summary comment (for visibility)
       - name: PR summary comment
         if: github.event_name == 'pull_request'
         uses: mshick/add-pr-comment@v2
