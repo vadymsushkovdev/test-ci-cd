@@ -61,7 +61,7 @@ jobs:
         run: trufflehog filesystem --json --repo_path . > trufflehog.json
 
       - name: Upload TruffleHog results
-        uses: actions/upload-artifact@v4.0.2
+        uses: actions/upload-artifact@v4
         if: always()
         with:
           name: trufflehog-results
