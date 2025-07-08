@@ -45,8 +45,8 @@ jobs:
         run: docker build -t app:${{ github.sha }} .
 
       - name: Trivy image scan
-        run: trivy image --format sarif --output trivy-img.sarif \
-          --severity CRITICAL,HIGH app:${{ github.sha }}
+        run: trivy image --format sarif --output trivy-img.sarif --severity CRITICAL,HIGH app:${{ github.sha }}
+
 
       # --- 4. Trufflehog (secrets) ---
       - name: Download Trufflehog
