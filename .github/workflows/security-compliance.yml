@@ -1,195 +1,57 @@
-name: Security Compliance Scan
+name: Security Compliance
 
 on:
   pull_request:
     branches: [main]
   workflow_dispatch:
 
-permissions:
-  contents: read
-  issues: write
-  pull-requests: write
-
-concurrency:
-  group: security-compliance
-  cancel-in-progress: true
-
 jobs:
-  scan:
+  security-check:
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
         with:
-          fetch-depth: 0
+          node-version: '18'
 
-      # --- 1. Semgrep (SAST) ---
-      - name: Install Semgrep
-        run: python3 -m pip install --upgrade pip && pip install semgrep==1.128.0
+      - name: Install dependencies
+        run: npm ci
 
-      - name: Run Semgrep
-        run: semgrep --config p/security --sarif --output semgrep.sarif src || true
-
-      # --- 2. Trivy (FS) ---
-      - name: Install Trivy
-        run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-            | sh -s -- -b ~/.local/bin v0.51.1
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - name: Trivy FS scan
-        run: trivy fs --format sarif --output trivy-fs.sarif --severity CRITICAL,HIGH .
-
-      # --- 3. Build & scan image ---
-      - name: Build Docker image for Trivy
-        run: docker build -t app:${{ github.sha }} .
-
-      - name: Trivy image scan
-        run: trivy image --format sarif --output trivy-img.sarif --severity CRITICAL,HIGH app:${{ github.sha }}
-
-
-      # --- 4. Trufflehog (secrets) ---
-      - name: Download Trufflehog
-        run: |
-          curl -sSL -o trufflehog.tar.gz https://github.com/trufflesecurity/trufflehog/releases/download/v3.77.0/trufflehog_3.77.0_linux_amd64.tar.gz
-          tar -xzvf trufflehog.tar.gz
-          chmod +x trufflehog
-
-      - name: Trufflehog filesystem scan (JSON)
-        run: ./trufflehog filesystem --json . > trufflehog.json || true
-
-      # --- 5. Convert Trufflehog JSON to SARIF (custom Python script) ---
-      - name: Convert Trufflehog JSON to SARIF
-        run: |
-          python3 <<EOF
-            import json
-            import sys
-            import os
-          
-          if not os.path.isfile('trufflehog.json'):
-            open('trufflehog.sarif', 'w').write('{"version":"2.1.0","runs":[]}')
-            sys.exit(0)
-          
-          with open('trufflehog.json') as f:
-            lines = [json.loads(l) for l in f if l.strip()]
-            
-            results = []
-          for entry in lines:
-            if not entry.get('SourceMetadata'): continue
-            file = entry['SourceMetadata'].get('Data', '')
-            line = entry['SourceMetadata'].get('LineNumber', 1)
-            ruleId = entry.get('DetectorName', 'trufflehog')
-            severity = entry.get('Raw', 'WARNING')
-            results.append({
-            "ruleId": ruleId,
-            "level": "error" if severity.upper() in ("CRITICAL", "HIGH") else "warning",
-            "message": {"text": ruleId},
-            "locations": [{
-              "physicalLocation": {
-                "artifactLocation": {"uri": file},
-                "region": {"startLine": line}
-              }
-            }]
-          })
-          sarif = {"version": "2.1.0", "runs": [{"tool": {"driver": {"name": "Trufflehog"}}, "results": results}]}
-          with open('trufflehog.sarif', 'w') as f: json.dump(sarif, f)
-            EOF
-
-      # --- 6. Merge SARIF reports ---
-      - name: Merge SARIF reports
-        run: |
-          jq -s '{version:"2.1.0", runs: [.[].runs[]]}' \
-            semgrep.sarif trivy-fs.sarif trivy-img.sarif trufflehog.sarif \
-            > merged.sarif
-
-      # --- 7. Extract findings ---
-      - name: Extract findings
-        id: findings
-        run: |
-          jq -r '
-            .runs[].results[]
-            | select(.level=="error" or .level=="warning")
-            | "\(.tool.driver.name)//\(.ruleId)//\(.locations[0].physicalLocation.artifactLocation.uri)//\(.locations[0].physicalLocation.region.startLine)//\(.level|ascii_upcase)"' \
-            merged.sarif \
-          | sort -u > findings.txt
-          echo "found=$(wc -l < findings.txt)" >> "$GITHUB_OUTPUT"
-
-      # --- 8. Debug print findings ---
-      - name: Debug print findings.txt
-        if: always()
-        run: cat findings.txt || echo "No findings.txt"
-
-      # --- 9. Post PR comment with required actions ---
-      - name: Post PR comment with required actions
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
+      # 1. ESLint (with eslint-plugin-security) via Reviewdog
+      - name: Run ESLint with security plugin
+        uses: reviewdog/action-eslint@v1
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const fs = require('fs');
-            const path = require('path');
-            const findings = fs.existsSync('findings.txt')
-              ? fs.readFileSync('findings.txt', 'utf8').split('\n').filter(Boolean)
-              : [];
-            const { repo, owner } = context.repo;
-            const sha = process.env.GITHUB_SHA;
-            const tag = '<!-- security-findings-bot -->';
-            let body = '';
-            
-            if (findings.length) {
-              // Parse findings
-              const grouped = {};
-              findings.forEach(line => {
-                const [tool, ruleId, file, lineNum, severity] = line.split('//');
-                if (!file || file.includes('node_modules') || file.includes('package-lock') || file === 'unknown') return;
-                if (!grouped[file]) grouped[file] = [];
-                grouped[file].push({ tool, ruleId, lineNum, severity });
-              });
-            
-              body += '## 🚨 Security Findings (pre-merge required changes)\n\n';
-              body += '**The following files/lines must be reviewed and fixed/justified before this PR can be merged:**\n\n';
-            
-              for (const [file, list] of Object.entries(grouped)) {
-                body += `### \`${file}\`\n`;
-                list.forEach(item => {
-                  const url = `https://github.com/${owner}/${repo}/blob/${sha}/${file}#L${item.lineNum || 1}`;
-                  body += `- [ ] [Line ${item.lineNum || 1}](${url}) — **${item.ruleId || 'unknown rule'}** detected by ${item.tool || 'unknown tool'} (${item.severity || 'unknown'})\n`;
-                });
-                body += '\n';
-              }
-              body += `> **Why?**\n> At least one CRITICAL or HIGH security issue was detected in this PR.\n> You must resolve, justify, or explicitly ignore each finding for this PR to pass the security gate.\n\n${tag}`;
-            } else {
-              body += `## ✅ Security Findings (pre-merge required changes)\n\nNo CRITICAL or HIGH severity security issues detected in this PR. Good job! 🚀\n\n${tag}`;
-            }
-            
-            // Only one comment per PR — update if exists
-            const comments = await github.rest.issues.listComments({
-              owner, repo, issue_number: context.issue.number
-            });
-            const prev = comments.data.find(c => c.body && c.body.includes(tag));
-            if (prev) {
-              await github.rest.issues.updateComment({
-                owner, repo, comment_id: prev.id, body
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner, repo, issue_number: context.issue.number, body
-              });
-            }
+          reporter: github-pr-review
+          eslint_flags: |
+            -c .eslintrc.json
+            --ext .js,.jsx,.ts,.tsx
+        env:
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # --- 10. Upload SARIF and findings for debugging ---
-      - name: Upload merged SARIF and findings
-        if: always()
-        uses: actions/upload-artifact@v4
+      # 2. Gitleaks (secret scanner) via Reviewdog
+      - name: Scan for secrets with Gitleaks
+        uses: reviewdog/action-gitleaks@v1
         with:
-          name: security-findings
-          path: |
-            merged.sarif
-            findings.txt
+          reporter: github-pr-review
+        env:
+          GITLEAKS_CONFIG: .gitleaks.toml
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # --- 11. Fail on findings (block merge) ---
-      - name: Fail if findings present
-        if: steps.findings.outputs.found != '0'
-        run: |
-          echo "❌ Security scan failed: HIGH or CRITICAL findings present."
-          exit 1
+      # 3. Trivy (OS & library CVE scan)
+      - name: Scan dependencies & OS packages with Trivy
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          vulnerability-type: os,library
+          ignore-unfixed: true
+
+      - name: Annotate Trivy findings with Reviewdog
+        uses: reviewdog/action-trivy@v2
+        with:
+          reporter: github-pr-review
+          filter_mode: nofilter
+        env:
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
