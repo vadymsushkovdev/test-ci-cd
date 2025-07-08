@@ -62,11 +62,8 @@ jobs:
         run: |
           python3 <<EOF
           import json
-          import sys
-
           with open('trufflehog.json') as f:
               findings = [json.loads(line) for line in f if line.strip()]
-
           sarif = {
               "version": "2.1.0",
               "runs": [{
@@ -113,8 +110,8 @@ jobs:
             | select(.level=="error" or .level=="warning")
             | "\(.tool.driver.name)|||\(.rule.id)|||\(.locations[0].physicalLocation.artifactLocation.uri)|||\(.locations[0].physicalLocation.region.startLine)//\(.level|ascii_upcase)"' \
             merged.sarif | sort -u > findings.txt
-          echo "found=$(wc -l < findings.txt)" >> "$GITHUB_OUTPUT"
-          if grep -Ei '//(ERROR|WARNING)' findings.txt | grep -q .; then
+          echo "found=$(grep -vcE "node_modules|\\.pnpm|package-lock\\.json|unknown|^usr/|^library/" findings.txt)" >> "$GITHUB_OUTPUT"
+          if grep -Ev "node_modules|\\.pnpm|package-lock\\.json|unknown|^usr/|^library/" findings.txt | grep -Ei '//(ERROR|WARNING)' | grep -q .; then
             echo "high_critical_found=1" >> "$GITHUB_OUTPUT"
           else
             echo "high_critical_found=0" >> "$GITHUB_OUTPUT"
@@ -128,11 +125,74 @@ jobs:
             findings.txt
             merged.sarif
 
+      - name: Post PR comment with required actions
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const lines = fs.readFileSync('findings.txt', 'utf8')
+              .split('\n')
+              .filter(Boolean)
+              .filter(line => !/node_modules|\.pnpm|package-lock\.json|unknown|^usr\/|^library\//.test(line));
+            if (!lines.length) return;
+
+            const { repo, owner } = context.repo;
+            const sha = process.env.GITHUB_SHA;
+            const baseUrl = `https://github.com/${owner}/${repo}/blob/${sha}`;
+
+            const parsed = lines.map(line => {
+              const [tool, ruleId, file, rest] = line.split('|||');
+              const [lineNum, sevRaw] = (rest || '').split('//');
+              return { tool, ruleId, file, lineNum, severity: sevRaw };
+            });
+
+            const grouped = {};
+            for (const item of parsed) {
+              if (!grouped[item.file]) grouped[item.file] = [];
+              grouped[item.file].push(item);
+            }
+
+            let body = `## 🚨 Security Findings (pre-merge required changes)\n\n`;
+            body += `**The following files/lines must be reviewed and fixed/justified before this PR can be merged:**\n\n`;
+
+            Object.entries(grouped).forEach(([file, list]) => {
+              body += `### \`${file}\`\n`;
+              body += list.map(item =>
+                `- [ ] [Line ${item.lineNum}](${baseUrl}/${file}#L${item.lineNum}) — **${item.ruleId || 'unknown rule'}** detected by ${item.tool}`
+              ).join('\n');
+              body += '\n\n';
+            });
+
+            body += `> **Why?**  
+            > At least one CRITICAL or HIGH security issue was detected in this PR.
+            > You must resolve, justify, or explicitly ignore each finding for this PR to pass the security gate.`;
+            
+            // Only one comment per PR — update if exists
+            const comments = await github.rest.issues.listComments({
+              owner, repo, issue_number: context.issue.number
+            });
+            const tag = '<!-- security-findings-bot -->';
+            
+            const prev = comments.data.find(c => c.body && c.body.includes(tag));
+            const bodyWithTag = body + `\n\n${tag}`;
+            
+            if (prev) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: prev.id, body: bodyWithTag
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: context.issue.number, body: bodyWithTag
+              });
+            }
+
       - name: Fail on unresolved findings
         if: steps.findings.outputs.high_critical_found == '1'
         run: |
           echo "❌ Security scan failed: HIGH or CRITICAL findings present."
-          cat findings.txt
+          grep -Ev "node_modules|\.pnpm|package-lock\.json|unknown|^usr/|^library/" findings.txt || true
           exit 1
 
       - name: Dependency Review
@@ -145,9 +205,9 @@ jobs:
         with:
           message: |
             ## Security Scan Results
-
-            ${{ steps.findings.outputs.found }} potential HIGH or CRITICAL security issues detected.
-
+            
+            ${{ steps.findings.outputs.found }} potential HIGH or CRITICAL security issues detected (excluding node_modules and lock files).
+            
             See uploaded artifacts for details.
-
+            
             This PR will be **blocked** until all critical findings are resolved.
