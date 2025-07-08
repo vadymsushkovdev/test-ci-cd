@@ -1,4 +1,4 @@
-name: Security Pre-Merge Gate
+name: Security Compliance Scan
 
 on:
   pull_request:
@@ -11,12 +11,11 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: security-gate
+  group: security-compliance
   cancel-in-progress: true
 
 jobs:
-  security-scan:
-    name: Security Compliance Scan
+  scan:
     runs-on: ubuntu-latest
 
     steps:
@@ -24,107 +23,103 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install Python + Semgrep
-        run: |
-          python -m pip install --upgrade pip
-          pip install semgrep==1.128.0
+      # --- 1. Semgrep (SAST) ---
+      - name: Install Semgrep
+        run: python3 -m pip install --upgrade pip && pip install semgrep==1.128.0
 
-      - name: Semgrep SAST
-        run: |
-          semgrep --config p/security --sarif --output semgrep.sarif src || true
+      - name: Run Semgrep
+        run: semgrep --config p/security --sarif --output semgrep.sarif src || true
 
+      # --- 2. Trivy (FS) ---
       - name: Install Trivy
         run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b ~/.local/bin v0.51.1
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b ~/.local/bin v0.51.1
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Trivy Filesystem Scan
+      - name: Trivy FS scan
         run: trivy fs --format sarif --output trivy-fs.sarif --severity CRITICAL,HIGH .
 
-      - name: Build Docker Image for Trivy
+      # --- 3. Build & scan image ---
+      - name: Build Docker image for Trivy
         run: docker build -t app:${{ github.sha }} .
 
-      - name: Trivy Image Scan
-        run: trivy image --format sarif --output trivy-img.sarif --severity CRITICAL,HIGH app:${{ github.sha }}
+      - name: Trivy image scan
+        run: trivy image --format sarif --output trivy-img.sarif \
+          --severity CRITICAL,HIGH app:${{ github.sha }}
 
-      - name: Download Trufflehog v3
+      # --- 4. Trufflehog (secrets) ---
+      - name: Download Trufflehog
         run: |
           curl -sSL -o trufflehog.tar.gz https://github.com/trufflesecurity/trufflehog/releases/download/v3.77.0/trufflehog_3.77.0_linux_amd64.tar.gz
-          tar -xzf trufflehog.tar.gz trufflehog
+          tar -xzvf trufflehog.tar.gz
           chmod +x trufflehog
 
-      - name: Trufflehog Filesystem Scan (JSON)
-        run: |
-          ./trufflehog filesystem --json . > trufflehog.json
-        continue-on-error: true
+      - name: Trufflehog filesystem scan (JSON)
+        run: ./trufflehog filesystem --json . > trufflehog.json || true
 
+      # --- 5. Convert Trufflehog JSON to SARIF (custom Python script) ---
       - name: Convert Trufflehog JSON to SARIF
         run: |
           python3 <<EOF
-          import json
+            import json
+            import sys
+            import os
+          
+          if not os.path.isfile('trufflehog.json'):
+            open('trufflehog.sarif', 'w').write('{"version":"2.1.0","runs":[]}')
+            sys.exit(0)
+          
           with open('trufflehog.json') as f:
-              findings = [json.loads(line) for line in f if line.strip()]
-          sarif = {
-              "version": "2.1.0",
-              "runs": [{
-                  "tool": {
-                      "driver": {
-                          "name": "trufflehog",
-                          "rules": [{
-                              "id": "trufflehog-secret",
-                              "name": "TruffleHog Secret",
-                              "shortDescription": {"text": "Potential secret detected by TruffleHog"}
-                          }]
-                      }
-                  },
-                  "results": [
-                      {
-                          "ruleId": "trufflehog-secret",
-                          "level": "error",
-                          "message": {"text": finding.get("reason", "Secret found")},
-                          "locations": [{
-                              "physicalLocation": {
-                                  "artifactLocation": {"uri": finding.get("path", "unknown")},
-                                  "region": {"startLine": finding.get("start", 1)}
-                              }
-                          }]
-                      }
-                      for finding in findings
-                  ]
-              }]
-          }
-          with open('trufflehog.sarif', 'w') as f:
-              json.dump(sarif, f, indent=2)
-          EOF
+            lines = [json.loads(l) for l in f if l.strip()]
+            
+            results = []
+          for entry in lines:
+            if not entry.get('SourceMetadata'): continue
+            file = entry['SourceMetadata'].get('Data', '')
+            line = entry['SourceMetadata'].get('LineNumber', 1)
+            ruleId = entry.get('DetectorName', 'trufflehog')
+            severity = entry.get('Raw', 'WARNING')
+            results.append({
+            "ruleId": ruleId,
+            "level": "error" if severity.upper() in ("CRITICAL", "HIGH") else "warning",
+            "message": {"text": ruleId},
+            "locations": [{
+              "physicalLocation": {
+                "artifactLocation": {"uri": file},
+                "region": {"startLine": line}
+              }
+            }]
+          })
+          sarif = {"version": "2.1.0", "runs": [{"tool": {"driver": {"name": "Trufflehog"}}, "results": results}]}
+          with open('trufflehog.sarif', 'w') as f: json.dump(sarif, f)
+            EOF
 
+      # --- 6. Merge SARIF reports ---
       - name: Merge SARIF reports
         run: |
           jq -s '{version:"2.1.0", runs: [.[].runs[]]}' \
-            semgrep.sarif trufflehog.sarif trivy-fs.sarif trivy-img.sarif > merged.sarif
+            semgrep.sarif trivy-fs.sarif trivy-img.sarif trufflehog.sarif \
+            > merged.sarif
 
+      # --- 7. Extract findings ---
       - name: Extract findings
         id: findings
         run: |
           jq -r '
             .runs[].results[]
             | select(.level=="error" or .level=="warning")
-            | "\(.tool.driver.name)|||\(.rule.id)|||\(.locations[0].physicalLocation.artifactLocation.uri)|||\(.locations[0].physicalLocation.region.startLine)//\(.level|ascii_upcase)"' \
-            merged.sarif | sort -u > findings.txt
-          echo "found=$(grep -vcE "node_modules|\\.pnpm|package-lock\\.json|unknown|^usr/|^library/" findings.txt)" >> "$GITHUB_OUTPUT"
-          if grep -Ev "node_modules|\\.pnpm|package-lock\\.json|unknown|^usr/|^library/" findings.txt | grep -Ei '//(ERROR|WARNING)' | grep -q .; then
-            echo "high_critical_found=1" >> "$GITHUB_OUTPUT"
-          else
-            echo "high_critical_found=0" >> "$GITHUB_OUTPUT"
-          fi
+            | "\(.tool.driver.name)//\(.ruleId)//\(.locations[0].physicalLocation.artifactLocation.uri)//\(.locations[0].physicalLocation.region.startLine)//\(.level|ascii_upcase)"' \
+            merged.sarif \
+          | sort -u > findings.txt
+          echo "found=$(wc -l < findings.txt)" >> "$GITHUB_OUTPUT"
 
-      - name: Upload findings
-        uses: actions/upload-artifact@v4
-        with:
-          name: security-findings
-          path: |
-            findings.txt
-            merged.sarif
+      # --- 8. Debug print findings ---
+      - name: Debug print findings.txt
+        if: always()
+        run: cat findings.txt || echo "No findings.txt"
 
+      # --- 9. Post PR comment with required actions ---
       - name: Post PR comment with required actions
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
@@ -133,95 +128,68 @@ jobs:
           script: |
             const fs = require('fs');
             const path = require('path');
-
-            // Read findings, filter out trash and group by real files
-            const lines = fs.readFileSync('findings.txt', 'utf8')
-              .split('\n')
-              .filter(Boolean)
-              .map(line => {
-                const [tool, ruleId, file, rest] = line.split('|||');
-                const [lineNum, sevRaw] = (rest || '').split('//');
-                return { tool, ruleId, file, lineNum, severity: sevRaw };
-              })
-              .filter(item =>
-                item.file &&
-                !item.file.startsWith('node_modules') &&
-                !item.file.startsWith('library/app') &&
-                !item.file.includes('pnpm') &&
-                !item.file.includes('package-lock') &&
-                !item.file.includes('unknown') &&
-                fs.existsSync(item.file)
-              );
-
-            if (!lines.length) return;
-
+            const findings = fs.existsSync('findings.txt')
+              ? fs.readFileSync('findings.txt', 'utf8').split('\n').filter(Boolean)
+              : [];
             const { repo, owner } = context.repo;
             const sha = process.env.GITHUB_SHA;
-            const baseUrl = `https://github.com/${owner}/${repo}/blob/${sha}`;
-
-            // Group by file
-            const grouped = {};
-            for (const item of lines) {
-              if (!grouped[item.file]) grouped[item.file] = [];
-              grouped[item.file].push(item);
-            }
-
-            let body = `## 🚨 Security Findings (pre-merge required changes)\n\n`;
-            body += `**The following files/lines must be reviewed and fixed/justified before this PR can be merged:**\n\n`;
-
-            for (const [file, list] of Object.entries(grouped)) {
-              body += `### \`${file}\`\n`;
-              for (const item of list) {
-                const url = `${baseUrl}/${file}#L${item.lineNum || 1}`;
-                body += `- [ ] [Line ${item.lineNum || 1}](${url}) — **${item.ruleId || 'unknown rule'}** detected by ${item.tool || 'unknown tool'} (${item.severity || 'unknown'})\n`;
+            const tag = '<!-- security-findings-bot -->';
+            let body = '';
+            
+            if (findings.length) {
+              // Parse findings
+              const grouped = {};
+              findings.forEach(line => {
+                const [tool, ruleId, file, lineNum, severity] = line.split('//');
+                if (!file || file.includes('node_modules') || file.includes('package-lock') || file === 'unknown') return;
+                if (!grouped[file]) grouped[file] = [];
+                grouped[file].push({ tool, ruleId, lineNum, severity });
+              });
+            
+              body += '## 🚨 Security Findings (pre-merge required changes)\n\n';
+              body += '**The following files/lines must be reviewed and fixed/justified before this PR can be merged:**\n\n';
+            
+              for (const [file, list] of Object.entries(grouped)) {
+                body += `### \`${file}\`\n`;
+                list.forEach(item => {
+                  const url = `https://github.com/${owner}/${repo}/blob/${sha}/${file}#L${item.lineNum || 1}`;
+                  body += `- [ ] [Line ${item.lineNum || 1}](${url}) — **${item.ruleId || 'unknown rule'}** detected by ${item.tool || 'unknown tool'} (${item.severity || 'unknown'})\n`;
+                });
+                body += '\n';
               }
-              body += '\n';
+              body += `> **Why?**\n> At least one CRITICAL or HIGH security issue was detected in this PR.\n> You must resolve, justify, or explicitly ignore each finding for this PR to pass the security gate.\n\n${tag}`;
+            } else {
+              body += `## ✅ Security Findings (pre-merge required changes)\n\nNo CRITICAL or HIGH severity security issues detected in this PR. Good job! 🚀\n\n${tag}`;
             }
-
-            body += `> **Why?**  
-            > At least one CRITICAL or HIGH security issue was detected in this PR.
-            > You must resolve, justify, or explicitly ignore each finding for this PR to pass the security gate.`;
             
             // Only one comment per PR — update if exists
             const comments = await github.rest.issues.listComments({
               owner, repo, issue_number: context.issue.number
             });
-            const tag = '<!-- security-findings-bot -->';
-            
             const prev = comments.data.find(c => c.body && c.body.includes(tag));
-            const bodyWithTag = body + `\n\n${tag}`;
-            
             if (prev) {
               await github.rest.issues.updateComment({
-                owner, repo, comment_id: prev.id, body: bodyWithTag
+                owner, repo, comment_id: prev.id, body
               });
             } else {
               await github.rest.issues.createComment({
-                owner, repo, issue_number: context.issue.number, body: bodyWithTag
+                owner, repo, issue_number: context.issue.number, body
               });
             }
 
+      # --- 10. Upload SARIF and findings for debugging ---
+      - name: Upload merged SARIF and findings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-findings
+          path: |
+            merged.sarif
+            findings.txt
 
-      - name: Fail on unresolved findings
-        if: steps.findings.outputs.high_critical_found == '1'
+      # --- 11. Fail on findings (block merge) ---
+      - name: Fail if findings present
+        if: steps.findings.outputs.found != '0'
         run: |
           echo "❌ Security scan failed: HIGH or CRITICAL findings present."
-          grep -Ev "node_modules|\.pnpm|package-lock\.json|unknown|^usr/|^library/" findings.txt || true
           exit 1
-
-      - name: Dependency Review
-        if: github.event_name == 'pull_request'
-        uses: actions/dependency-review-action@v4
-
-      - name: PR summary comment
-        if: github.event_name == 'pull_request'
-        uses: mshick/add-pr-comment@v2
-        with:
-          message: |
-            ## Security Scan Results
-            
-            ${{ steps.findings.outputs.found }} potential HIGH or CRITICAL security issues detected (excluding node_modules and lock files).
-            
-            See uploaded artifacts for details.
-            
-            This PR will be **blocked** until all critical findings are resolved.
