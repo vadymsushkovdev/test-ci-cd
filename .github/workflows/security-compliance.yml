@@ -25,15 +25,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      # 2. Install Python + Semgrep
+      # 2. Install Python and Semgrep
       - name: Install Python + Semgrep
         run: |
           python -m pip install --upgrade pip
           pip install semgrep==1.128.0
 
-      # 3. Run Semgrep (exit 1 if findings at ERROR/WARNING)
+      # 3. Run Semgrep SAST
       - name: Semgrep SAST
-        id: semgrep
         run: |
           semgrep --config p/security --sarif --output semgrep.sarif src || true
 
@@ -44,33 +43,33 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       # 5. Trivy filesystem scan
-      - name: Trivy FS
+      - name: Trivy Filesystem Scan
         run: trivy fs --format sarif --output trivy-fs.sarif --severity CRITICAL,HIGH .
 
-      # 6. Build Docker image for Trivy
-      - name: Build Docker image for Trivy
+      # 6. Build Docker image for Trivy scan
+      - name: Build Docker Image for Trivy
         run: docker build -t app:${{ github.sha }} .
 
       # 7. Trivy image scan
-      - name: Trivy image
+      - name: Trivy Image Scan
         run: trivy image --format sarif --output trivy-img.sarif --severity CRITICAL,HIGH app:${{ github.sha }}
 
-      # 8. Install TruffleHog
-      - name: Install TruffleHog
-        run: pip install trufflehog==2.2.1
+      # 8. Install TruffleHog v3
+      - name: Install TruffleHog v3
+        run: pip install trufflehog==3.73.1
 
-      # 9. TruffleHog scan (don't fail job if secrets found, fail later)
-      - name: TruffleHog scan (SARIF)
-        run: trufflehog filesystem --format sarif --output trufflehog.sarif .
+      # 9. TruffleHog SARIF scan
+      - name: TruffleHog Filesystem Scan (SARIF)
+        run: trufflehog filesystem --sarif --output trufflehog.sarif .
         continue-on-error: true
 
       # 10. Merge SARIF reports
-      - name: Merge SARIF
+      - name: Merge SARIF reports
         run: |
           jq -s '{version:"2.1.0", runs: [.[].runs[]]}' \
             semgrep.sarif trufflehog.sarif trivy-fs.sarif trivy-img.sarif > merged.sarif
 
-      # 11. Extract findings
+      # 11. Extract findings (errors/warnings only)
       - name: Extract findings
         id: findings
         run: |
@@ -80,14 +79,13 @@ jobs:
             | "\(.tool.driver.name)|||\(.rule.id)|||\(.locations[0].physicalLocation.artifactLocation.uri)|||\(.locations[0].physicalLocation.region.startLine)//\(.level|ascii_upcase)"' \
             merged.sarif | sort -u > findings.txt
           echo "found=$(wc -l < findings.txt)" >> "$GITHUB_OUTPUT"
-          # Find if any CRITICAL or HIGH exists
           if grep -Ei '//(ERROR|WARNING)' findings.txt | grep -q .; then
             echo "high_critical_found=1" >> "$GITHUB_OUTPUT"
           else
             echo "high_critical_found=0" >> "$GITHUB_OUTPUT"
           fi
 
-      # 12. Upload artifacts
+      # 12. Upload findings as an artifact
       - name: Upload findings
         uses: actions/upload-artifact@v4
         with:
@@ -109,7 +107,7 @@ jobs:
         if: github.event_name == 'pull_request'
         uses: actions/dependency-review-action@v4
 
-      # 15. Optional: Comment on PR with summary
+      # 15. PR summary comment (optional, but good for DX)
       - name: PR summary comment
         if: github.event_name == 'pull_request'
         uses: mshick/add-pr-comment@v2
@@ -117,10 +115,8 @@ jobs:
           message: |
             ## Security Scan Results
 
-            ${{ steps.findings.outputs.found }} potential HIGH or CRITICAL security issues were detected.
+            ${{ steps.findings.outputs.found }} potential HIGH or CRITICAL security issues detected.
 
             See uploaded artifacts for details.
 
             This PR will be **blocked** until all critical findings are resolved.
-
-
